@@ -29,7 +29,7 @@ from google.oauth2.service_account import Credentials
 # =============================================================================
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
-MARGIN_SHEET_NAME = "信用需給"
+MARGIN_SHEET_NAME = "信用残データ"
 
 JPX_PDF_URL_TEMPLATE = (
     "https://www.jpx.co.jp/markets/statistics-equities/"
