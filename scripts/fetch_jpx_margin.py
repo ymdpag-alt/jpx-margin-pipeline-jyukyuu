@@ -7,15 +7,17 @@ JPX「銘柄別信用取引週末残高」PDFを取得し、
   - 2回目以降は新しい「申込日（日本語形式）」列だけ右端に追加
   - 既存銘柄は行を維持したままセルを更新、新規銘柄は末尾に追加
 
-【重要】PDFの列レイアウトは実データを見て調整が必要です。
-下記 parse_margin_pdf() 内の列インデックスは仮の設計です。
-最初の実行は必ずローカルで dry-run し、パース結果を目視確認してください。
+【2026/7/10申込分のPDFで実データ確認済み】
+PDFは罫線なしのテキストレイアウトのため、pdfplumberのextract_tables()は使わず、
+extract_text()で取った行を正規表現でパースする方式にしている。
+また、このPDF自体には「信用倍率」列が存在しないため、
+買残高(合計)÷売残高(合計) で自前計算している。
 """
 
 import io
 import os
+import re
 import sys
-import time
 from datetime import datetime, timedelta
 
 import gspread
@@ -102,80 +104,101 @@ def download_pdf(date_yyyymmdd: str) -> bytes:
     return resp.content
 
 
+ISIN_PATTERN = re.compile(r"JP[A-Z0-9]{10}")
+
+
 def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
-    PDFから表を抽出し、DataFrameで返す。
+    PDFのテキストを1行ずつ正規表現でパースし、DataFrameで返す。
     列: 銘柄コード, 銘柄名, 買い残, 売り残, 倍率
 
-    【要調整】実際のPDFレイアウトに合わせて列マッピングを直してください。
+    1データ行の並び（実データで確認済み）:
+      [貸借フラグB] 銘柄名 株式種別 5桁コード ISIN
+      売残高(合計) 前週比 買残高(合計) 前週比
+      売残高(一般信用) 前週比 売残高(制度信用) 前週比
+      買残高(一般信用) 前週比 買残高(制度信用) 前週比
+
+    「倍率」列はPDFに存在しないため、買残高(合計)÷売残高(合計)で算出する。
     """
-    rows = []
+    records = []
+    skipped = 0
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         print(f"  総ページ数: {len(pdf.pages)}")
-
-        # --- デバッグ出力: 1ページ目の生テキストと検出テーブル数を必ず出す ---
-        page0 = pdf.pages[0]
-        text0 = page0.extract_text() or "(テキストなし)"
-        print("  === DEBUG: 1ページ目テキスト（先頭1500文字） ===")
-        print(text0[:1500])
-        print("  === DEBUG ここまで ===")
-
-        tables0 = page0.extract_tables()
-        print(f"  DEBUG: extract_tables()で検出したテーブル数(1ページ目): {len(tables0)}")
-        if tables0:
-            print("  DEBUG: 先頭テーブルの先頭5行:")
-            for r in tables0[0][:5]:
-                print(f"    {r}")
-
-        # 罫線なし表向けの別設定も試す（横方向の文字位置だけで判定）
-        tables0_lines = page0.extract_tables(
-            table_settings={
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-            }
-        )
-        print(f"  DEBUG: text戦略で検出したテーブル数(1ページ目): {len(tables0_lines)}")
-        if tables0_lines:
-            print("  DEBUG: text戦略テーブルの先頭5行:")
-            for r in tables0_lines[0][:5]:
-                print(f"    {r}")
-        # --- デバッグ出力ここまで ---
-
         for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for raw_row in table:
-                    if raw_row is None:
-                        continue
-                    # ヘッダー行・空行をスキップ
-                    cell0 = (raw_row[0] or "").strip()
-                    if not cell0 or not cell0[0].isdigit():
-                        continue
-                    rows.append(raw_row)
+            text = page.extract_text() or ""
+            for line in text.split("\n"):
+                m = ISIN_PATTERN.search(line)
+                if not m:
+                    continue  # ISINを含まない行（見出し・区切り等）はスキップ
 
-    if not rows:
-        print("  警告: 標準設定では表を抽出できませんでした。上のDEBUG出力を確認してください。")
-        raise ValueError("PDFから表データを抽出できませんでした。レイアウトを確認してください。")
+                before = line[: m.start()].strip()
+                after = line[m.end():].strip()
 
-    # 仮の列マッピング（実データ確認後に調整）
-    # 想定カラム例: [コード, 銘柄名, 買い残, 売り残, 倍率, ...]
-    records = []
-    for r in rows:
-        try:
-            code = r[0].strip()
-            name = r[1].strip() if len(r) > 1 else ""
-            buy = _to_number(r[2]) if len(r) > 2 else None
-            sell = _to_number(r[3]) if len(r) > 3 else None
-            ratio = _to_number(r[4]) if len(r) > 4 else None
-            records.append(
-                {"銘柄コード": code, "銘柄名": name, "買い残": buy, "売り残": sell, "倍率": ratio}
-            )
-        except (IndexError, ValueError):
-            continue
+                code_match = re.search(r"(\d{5})\s*$", before)
+                if not code_match:
+                    skipped += 1
+                    continue
+
+                code5 = code_match.group(1)
+                code = code5[:4]  # 末尾の付番(通常は0)を除いた4桁コード
+                name = before[: code_match.start()].strip()
+                name = re.sub(r"^B\s+", "", name)  # 先頭の貸借銘柄フラグを除去
+                name = re.sub(
+                    r"\s*(普通株式|出資証券|投資口|受益証券|優先株式)\s*$", "", name
+                )  # 末尾の株式種別を除去
+
+                tokens = after.split()
+                values, _ = _parse_signed_tokens(tokens, 12)
+                sell_total, _, buy_total = values[0], values[1], values[2]
+
+                if sell_total is None or buy_total is None:
+                    skipped += 1
+                    continue
+
+                ratio = round(buy_total / sell_total, 2) if sell_total else None
+
+                records.append(
+                    {
+                        "銘柄コード": code,
+                        "銘柄名": name,
+                        "買い残": buy_total,
+                        "売り残": sell_total,
+                        "倍率": ratio,
+                    }
+                )
 
     df = pd.DataFrame(records)
-    print(f"  抽出件数: {len(df)} 銘柄")
+    print(f"  抽出件数: {len(df)} 銘柄（パース失敗でスキップ: {skipped} 行）")
+    if df.empty:
+        raise ValueError("PDFから銘柄データを抽出できませんでした。レイアウトが変わった可能性があります。")
     return df
+
+
+def _parse_signed_tokens(tokens: list[str], count: int):
+    """
+    トークン列から count 個の数値を読み取る。
+    '▲ 数字' は負の値として扱う（前週比の減少表記）。
+    戻り値: (数値リスト, 未使用トークンの残り)
+    """
+    values = []
+    i = 0
+    for _ in range(count):
+        if i >= len(tokens):
+            values.append(None)
+            continue
+        if tokens[i] in ("▲", "△"):
+            i += 1
+            if i < len(tokens):
+                num = _to_number(tokens[i])
+                values.append(-num if num is not None else None)
+                i += 1
+            else:
+                values.append(None)
+        else:
+            values.append(_to_number(tokens[i]))
+            i += 1
+    return values, tokens[i:]
 
 
 def _to_number(s):
