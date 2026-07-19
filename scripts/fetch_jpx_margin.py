@@ -1,17 +1,18 @@
 """
 JPX「銘柄別信用取引週末残高」PDFを取得し、
-信用買い残・信用売り残・信用倍率をGoogle Spreadsheetへ書き込む。
+一般信用買残高・一般信用売残高・制度信用買残高・制度信用売残高を
+それぞれ別シートにGoogle Spreadsheetへ書き込む。
 
 添付いただいたyfinanceコードの update_spreadsheet() と同じ設計思想:
   - 初回はヘッダー＋全銘柄を書き込み
-  - 2回目以降は新しい「申込日（日本語形式）」列だけ右端に追加
+  - 2回目以降は新しい「申込日（日本語形式）」列だけ右端に追加（1週1列）
   - 既存銘柄は行を維持したままセルを更新、新規銘柄は末尾に追加
 
 【2026/7/10申込分のPDFで実データ確認済み】
 PDFは罫線なしのテキストレイアウトのため、pdfplumberのextract_tables()は使わず、
 extract_text()で取った行を正規表現でパースする方式にしている。
-また、このPDF自体には「信用倍率」列が存在しないため、
-買残高(合計)÷売残高(合計) で自前計算している。
+数値中の「▲」はマイナスとしてパースする。
+合計値(買い残/売り残/倍率)はここでは計算しない（別シートでユーザー側が算出）。
 """
 
 import io
@@ -31,17 +32,22 @@ from google.oauth2.service_account import Credentials
 # =============================================================================
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
-MARGIN_SHEET_NAME = "信用残データ"
+
+# 4種類の内訳データをそれぞれ別シートに書き込む（合計はユーザー側の別シートで算出）
+SHEET_NAMES = {
+    "一般信用買残高": "一般信用買残高",
+    "一般信用売残高": "一般信用売残高",
+    "制度信用買残高": "制度信用買残高",
+    "制度信用売残高": "制度信用売残高",
+}
 
 JPX_PDF_URL_TEMPLATE = (
     "https://www.jpx.co.jp/markets/statistics-equities/"
     "margin/tvdivq0000001rnl-att/syumatsu{date}00.pdf"
 )
 
-# シート構成: A列=銘柄コード, B列=銘柄名, C列以降=申込日ごとのデータ
-# 1日付につき「買い残/売り残/倍率」の3列を使う
+# シート構成: A列=銘柄コード, B列=銘柄名, C列以降=申込日ごとに1列
 FIXED_COLS = 2
-COLS_PER_DATE = 3  # 買い残・売り残・倍率
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -110,7 +116,7 @@ ISIN_PATTERN = re.compile(r"JP[A-Z0-9]{10}")
 def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
     PDFのテキストを1行ずつ正規表現でパースし、DataFrameで返す。
-    列: 銘柄コード, 銘柄名, 買い残, 売り残, 倍率
+    列: 銘柄コード, 銘柄名, 一般信用買残高, 一般信用売残高, 制度信用買残高, 制度信用売残高
 
     1データ行の並び（実データで確認済み）:
       [貸借フラグB] 銘柄名 株式種別 5桁コード ISIN
@@ -118,7 +124,8 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
       売残高(一般信用) 前週比 売残高(制度信用) 前週比
       買残高(一般信用) 前週比 買残高(制度信用) 前週比
 
-    「倍率」列はPDFに存在しないため、買残高(合計)÷売残高(合計)で算出する。
+    合計値はここでは計算しない（別シートでユーザー側が算出するため）。
+    数値中の「▲」は負の値としてパースする（_parse_signed_tokensで対応済み）。
     """
     records = []
     skipped = 0
@@ -150,21 +157,24 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
 
                 tokens = after.split()
                 values, _ = _parse_signed_tokens(tokens, 12)
-                sell_total, _, buy_total = values[0], values[1], values[2]
+                # values[4]=売残高一般信用, [6]=売残高制度信用, [8]=買残高一般信用, [10]=買残高制度信用
+                general_sell = values[4]
+                standard_sell = values[6]
+                general_buy = values[8]
+                standard_buy = values[10]
 
-                if sell_total is None or buy_total is None:
+                if None in (general_sell, standard_sell, general_buy, standard_buy):
                     skipped += 1
                     continue
-
-                ratio = round(buy_total / sell_total, 2) if sell_total else None
 
                 records.append(
                     {
                         "銘柄コード": code,
                         "銘柄名": name,
-                        "買い残": buy_total,
-                        "売り残": sell_total,
-                        "倍率": ratio,
+                        "一般信用買残高": general_buy,
+                        "一般信用売残高": general_sell,
+                        "制度信用買残高": standard_buy,
+                        "制度信用売残高": standard_sell,
                     }
                 )
 
@@ -240,75 +250,68 @@ def get_or_create_worksheet(gc: gspread.Client, sheet_name: str, min_cols: int =
     return ws
 
 
-def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, date_yyyymmdd: str):
+def update_spreadsheet_single_column(
+    gc: gspread.Client, df: pd.DataFrame, sheet_name: str, value_col: str, date_yyyymmdd: str
+):
     """
-    週次で「買い残/売り残/倍率」の3列を右端に追加する。
+    指定シートに、申込日(日本語形式)を列名とする1列を右端に追加する。
     既存銘柄は行を維持したままセルを更新、新規銘柄は末尾に追加。
+    （添付いただいた元のyfinanceコードの update_spreadsheet() と同じ設計）
     """
-    ws = get_or_create_worksheet(gc, MARGIN_SHEET_NAME)
+    ws = get_or_create_worksheet(gc, sheet_name)
     existing = ws.get_all_values()
     jp_date = to_japanese_date(date_yyyymmdd)
 
-    date_header_group = [f"{jp_date}_買い残", f"{jp_date}_売り残", f"{jp_date}_倍率"]
-
     # --- 初回書き込み ---
     if not existing:
-        print("  初回書き込み")
-        header = ["銘柄コード", "銘柄名"] + date_header_group
-        rows = [
-            [row["銘柄コード"], row["銘柄名"], row["買い残"], row["売り残"], row["倍率"]]
-            for _, row in df.iterrows()
-        ]
-        ws = get_or_create_worksheet(gc, MARGIN_SHEET_NAME, min_cols=len(header))
+        print(f"  [{sheet_name}] 初回書き込み")
+        header = ["銘柄コード", "銘柄名", jp_date]
+        rows = [[row["銘柄コード"], row["銘柄名"], row[value_col]] for _, row in df.iterrows()]
+        ws = get_or_create_worksheet(gc, sheet_name, min_cols=len(header))
         ws.update(values=[header] + _native_rows(rows), range_name="A1", value_input_option="USER_ENTERED")
         return
 
     header = existing[0]
     existing_codes = [row[0] for row in existing[1:]]
 
-    if any(h.startswith(jp_date) for h in header):
-        print(f"  {jp_date} のデータは既に追加済みです。スキップします")
+    if jp_date in header:
+        print(f"  [{sheet_name}] {jp_date} のデータは既に追加済みです。スキップします")
         return
 
-    col_start = len(header) + 1
-    col_end = col_start + COLS_PER_DATE - 1
-    ws = get_or_create_worksheet(gc, MARGIN_SHEET_NAME, min_cols=col_end)
-
-    header_range = (
-        f"{gspread.utils.rowcol_to_a1(1, col_start)}"
-        f":{gspread.utils.rowcol_to_a1(1, col_end)}"
+    col_idx = len(header) + 1
+    ws = get_or_create_worksheet(gc, sheet_name, min_cols=col_idx)
+    ws.update(
+        values=[[jp_date]],
+        range_name=gspread.utils.rowcol_to_a1(1, col_idx),
+        value_input_option="USER_ENTERED",
     )
-    ws.update(values=[date_header_group], range_name=header_range, value_input_option="USER_ENTERED")
 
     batch_updates = []
     new_rows = []
     for _, row in df.iterrows():
         code = str(row["銘柄コード"])
-        values = [row["買い残"], row["売り残"], row["倍率"]]
+        value = row[value_col]
         if code in existing_codes:
             row_idx = existing_codes.index(code) + 2
-            cell_range = (
-                f"{gspread.utils.rowcol_to_a1(row_idx, col_start)}"
-                f":{gspread.utils.rowcol_to_a1(row_idx, col_end)}"
-            )
-            batch_updates.append({"range": cell_range, "values": [_native_row(values)]})
+            cell = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+            batch_updates.append({"range": cell, "values": [_native_row([value])]})
         else:
-            full_row = [code, row["銘柄名"]] + [""] * (len(header) - 2) + values
+            full_row = [code, row["銘柄名"]] + [""] * (len(header) - 2) + [value]
             new_rows.append(_native_row(full_row))
 
     if batch_updates:
-        print(f"  既存銘柄を更新: {len(batch_updates)} 件")
+        print(f"  [{sheet_name}] 既存銘柄を更新: {len(batch_updates)} 件")
         ws.batch_update(batch_updates, value_input_option="USER_ENTERED")
 
     if new_rows:
-        print(f"  新規銘柄を追加: {len(new_rows)} 件")
+        print(f"  [{sheet_name}] 新規銘柄を追加: {len(new_rows)} 件")
         start_row = len(existing) + 1
-        total_cols = len(header) + COLS_PER_DATE
-        ws = get_or_create_worksheet(gc, MARGIN_SHEET_NAME, min_cols=total_cols)
+        total_cols = len(header) + 1
+        ws = get_or_create_worksheet(gc, sheet_name, min_cols=total_cols)
         end_a1 = gspread.utils.rowcol_to_a1(start_row + len(new_rows) - 1, total_cols)
         ws.update(values=new_rows, range_name=f"A{start_row}:{end_a1}", value_input_option="USER_ENTERED")
 
-    print("  書き込み完了！")
+    print(f"  [{sheet_name}] 書き込み完了！")
 
 
 def _native_row(values):
@@ -342,7 +345,9 @@ def main():
     df = parse_margin_pdf(pdf_bytes)
 
     gc = authenticate_google_sheets()
-    update_spreadsheet(gc, df, target_date)
+
+    for value_col, sheet_name in SHEET_NAMES.items():
+        update_spreadsheet_single_column(gc, df, sheet_name, value_col, target_date)
 
 
 if __name__ == "__main__":
