@@ -111,6 +111,36 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
     rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        print(f"  総ページ数: {len(pdf.pages)}")
+
+        # --- デバッグ出力: 1ページ目の生テキストと検出テーブル数を必ず出す ---
+        page0 = pdf.pages[0]
+        text0 = page0.extract_text() or "(テキストなし)"
+        print("  === DEBUG: 1ページ目テキスト（先頭1500文字） ===")
+        print(text0[:1500])
+        print("  === DEBUG ここまで ===")
+
+        tables0 = page0.extract_tables()
+        print(f"  DEBUG: extract_tables()で検出したテーブル数(1ページ目): {len(tables0)}")
+        if tables0:
+            print("  DEBUG: 先頭テーブルの先頭5行:")
+            for r in tables0[0][:5]:
+                print(f"    {r}")
+
+        # 罫線なし表向けの別設定も試す（横方向の文字位置だけで判定）
+        tables0_lines = page0.extract_tables(
+            table_settings={
+                "vertical_strategy": "text",
+                "horizontal_strategy": "text",
+            }
+        )
+        print(f"  DEBUG: text戦略で検出したテーブル数(1ページ目): {len(tables0_lines)}")
+        if tables0_lines:
+            print("  DEBUG: text戦略テーブルの先頭5行:")
+            for r in tables0_lines[0][:5]:
+                print(f"    {r}")
+        # --- デバッグ出力ここまで ---
+
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
@@ -124,6 +154,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                     rows.append(raw_row)
 
     if not rows:
+        print("  警告: 標準設定では表を抽出できませんでした。上のDEBUG出力を確認してください。")
         raise ValueError("PDFから表データを抽出できませんでした。レイアウトを確認してください。")
 
     # 仮の列マッピング（実データ確認後に調整）
