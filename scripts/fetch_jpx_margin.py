@@ -28,7 +28,7 @@ from google.oauth2.service_account import Credentials
 # 定数定義
 # =============================================================================
 
-SPREADSHEET_ID = os.environ.get("1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY", "")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 MARGIN_SHEET_NAME = "信用需給"
 
 JPX_PDF_URL_TEMPLATE = (
