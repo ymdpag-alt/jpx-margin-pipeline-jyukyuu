@@ -113,30 +113,11 @@ def download_pdf(date_yyyymmdd: str) -> bytes:
 ISIN_PATTERN = re.compile(r"JP[A-Z0-9]{10}")
 NUMBER_PATTERN = re.compile(r"(▲?)\s*(\d{1,3}(?:,\d{3})*)")
 
-# 小計・総合計行は、JPXの公表フォーマット上この固定順で現れる
-# （2026/7/10申込分のPDFで実データ確認済み）。
-# 件数が一致しない場合は書式変更とみなし、集計行の書き込みはスキップする。
-SUBTOTAL_LABELS = [
-    "貸借銘柄 合計",
-    "貸借銘柄 プライム 小計",
-    "貸借銘柄 スタンダード 小計",
-    "貸借銘柄 グロース 小計",
-    "貸借銘柄 投信等 小計",
-    "制度信用銘柄 合計",
-    "制度信用銘柄 プライム 小計",
-    "制度信用銘柄 スタンダード 小計",
-    "制度信用銘柄 グロース 小計",
-    "制度信用銘柄 投信等 小計",
-    "その他 合計",
-    "その他 プライム 小計",
-    "その他 スタンダード 小計",
-    "その他 グロース 小計",
-    "総合計",
-    "全体 プライム 小計",
-    "全体 スタンダード 小計",
-    "全体 グロース 小計",
-    "全体 投信等 小計",
-]
+# 小計・総合計行のラベルは固定の行数リストではなく、行の中身のキーワードから
+# 動的に判定する（JPX側の区分数が週によって増減しても対応できるようにするため）。
+SEGMENT_KEYWORDS = ["プライム", "スタンダード", "グロース", "投信等"]
+CATEGORY_ORDER = ["貸借銘柄", "制度信用銘柄", "その他", "総合計", "全体"]
+SEGMENT_ORDER = ["合計", "プライム", "スタンダード", "グロース", "投信等"]
 
 
 def _parse_subtotal_line(line: str):
@@ -162,6 +143,44 @@ def _parse_subtotal_line(line: str):
     return numbers[:12]
 
 
+def _label_subtotal_line(line: str, state: dict):
+    """
+    小計・総合計行のラベル（例: "貸借銘柄 プライム 小計"）を、
+    行の中身のキーワードとカテゴリの追跡状態から動的に判定する。
+    state は呼び出し元で使い回す辞書:
+      {"current_category": str|None, "passed_total": bool}
+    判定できなければ None を返す。
+    """
+    if "貸借銘柄" in line:
+        state["current_category"] = "貸借銘柄"
+        return "貸借銘柄 合計"
+    if "制度信用銘柄" in line:
+        state["current_category"] = "制度信用銘柄"
+        return "制度信用銘柄 合計"
+    if re.search(r"その他.*other issues", line):
+        state["current_category"] = "その他"
+        return "その他 合計"
+    if "総合計" in line:
+        state["passed_total"] = True
+        return "総合計"
+
+    for seg in SEGMENT_KEYWORDS:
+        if seg in line and "小計" in line:
+            # 総合計より後に出てくる区分別小計は、カテゴリを横断した「全体」の集計
+            category = "全体" if state["passed_total"] else state["current_category"]
+            if category is None:
+                return None
+            return f"{category} {seg} 小計"
+
+    return None
+
+
+def _subtotal_sort_key(label: str) -> int:
+    cat_idx = next((i for i, c in enumerate(CATEGORY_ORDER) if label.startswith(c)), len(CATEGORY_ORDER))
+    seg_idx = next((i for i, s in enumerate(SEGMENT_ORDER) if s in label), len(SEGMENT_ORDER))
+    return cat_idx * 10 + seg_idx
+
+
 def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
     PDFのテキストを1行ずつ正規表現でパースし、DataFrameで返す。
@@ -173,14 +192,16 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
       売残高(一般信用) 前週比 売残高(制度信用) 前週比
       買残高(一般信用) 前週比 買残高(制度信用) 前週比
 
-    銘柄行の他に、小計・総合計行（SUBTOTAL_LABELS）も
-    銘柄コード "SUB00"〜"SUB16" の特別行として先頭に含める。
+    銘柄行の他に、小計・総合計行も "SUB_<ラベル名>" という特別なコードの行として
+    先頭に含める。ラベルはキーワードから動的判定するため、区分数の増減に対応できる。
     合計値はここでは計算しない（PDFに実際に記載された小計・総合計値をそのまま使う）。
     数値中の「▲」は負の値としてパースする。
     """
     records = []
-    subtotal_rows_raw = []
+    subtotal_dict: dict[str, list] = {}  # label -> 12個の数値（後勝ちで上書き）
+    unlabeled_lines = []  # ラベル判定できなかった小計候補行（調査用）
     skipped = 0
+    label_state = {"current_category": None, "passed_total": False}
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         print(f"  総ページ数: {len(pdf.pages)}")
@@ -191,7 +212,13 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                 if not m:
                     parsed = _parse_subtotal_line(line)
                     if parsed:
-                        subtotal_rows_raw.append(parsed)
+                        label = _label_subtotal_line(line, label_state)
+                        if label:
+                            if label in subtotal_dict:
+                                print(f"  警告: 小計ラベル '{label}' が複数回検出されました。後の値で上書きします。")
+                            subtotal_dict[label] = parsed
+                        else:
+                            unlabeled_lines.append(line)
                     continue  # ISINを含まない行（見出し・区切り等）はスキップ
 
                 before = line[: m.start()].strip()
@@ -238,34 +265,37 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     if stock_df.empty:
         raise ValueError("PDFから銘柄データを抽出できませんでした。レイアウトが変わった可能性があります。")
 
-    # 銘柄コード順（数値の昇順）にソート。
-    # これにより初回書き込み時の行順が揃い、以後の週で新規上場銘柄は
-    # 既存コードに一致しないため自動的に末尾へ追加される。
-    stock_df["_sort_key"] = pd.to_numeric(stock_df["銘柄コード"], errors="coerce")
+    # 銘柄コード順（数値の昇順）にソート。実銘柄の並び順は集計行より必ず後ろになるよう
+    # 十分大きいオフセットを足す。これにより初回書き込み時の行順が揃い、
+    # 以後の週で新規上場銘柄は既存コードに一致しないため自動的に末尾へ追加される。
+    stock_df["_sort_key"] = 10_000 + pd.to_numeric(stock_df["銘柄コード"], errors="coerce").fillna(99_999)
 
-    print(f"  小計/総合計行の検出数: {len(subtotal_rows_raw)} 件（期待値: {len(SUBTOTAL_LABELS)} 件）")
+    print(f"  小計/総合計行の検出数: {len(subtotal_dict)} 件")
+    if unlabeled_lines:
+        print(f"  警告: ラベルを判定できなかった小計候補行が {len(unlabeled_lines)} 件あります:")
+        for l in unlabeled_lines:
+            print(f"    {l!r}")
 
-    if len(subtotal_rows_raw) == len(SUBTOTAL_LABELS):
+    if subtotal_dict:
         summary_records = []
-        for i, (values, label) in enumerate(zip(subtotal_rows_raw, SUBTOTAL_LABELS)):
+        for label, values in subtotal_dict.items():
             general_sell, standard_sell = values[4], values[6]
             general_buy, standard_buy = values[8], values[10]
             summary_records.append(
                 {
-                    "銘柄コード": f"SUB{i:02d}",
+                    "銘柄コード": "SUB_" + label.replace(" ", ""),
                     "銘柄名": label,
                     "一般信用買残高": general_buy,
                     "一般信用売残高": general_sell,
                     "制度信用買残高": standard_buy,
                     "制度信用売残高": standard_sell,
-                    # 実銘柄コードより必ず前に来るよう非常に小さい値にする
-                    "_sort_key": i - 1000,
+                    "_sort_key": _subtotal_sort_key(label),
                 }
             )
         summary_df = pd.DataFrame(summary_records)
         df = pd.concat([summary_df, stock_df], ignore_index=True)
     else:
-        print("  警告: 小計/総合計行の件数が想定と異なるため、集計行の書き込みをスキップします。")
+        print("  警告: 小計/総合計行を1件も検出できませんでした。集計行なしで続行します。")
         df = stock_df
 
     df = df.sort_values("_sort_key", na_position="last").drop(columns="_sort_key").reset_index(drop=True)
