@@ -272,10 +272,13 @@ def update_spreadsheet_single_column(
     """
     ws = get_or_create_worksheet(gc, sheet_name)
     existing = ws.get_all_values()
+    # 新規作成直後のシートは get_all_values() が [] ではなく
+    # 中身が空の行を返すことがあるため、実際に文字が入っているかで判定する
+    has_header = bool(existing) and any(cell.strip() for cell in existing[0])
     jp_date = to_japanese_date(date_yyyymmdd)
 
     # --- 初回書き込み ---
-    if not existing:
+    if not has_header:
         print(f"  [{sheet_name}] 初回書き込み")
         header = ["銘柄コード", "銘柄名", jp_date]
         rows = [[row["銘柄コード"], row["銘柄名"], row[value_col]] for _, row in df.iterrows()]
