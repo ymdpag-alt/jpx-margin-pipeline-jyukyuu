@@ -3,7 +3,7 @@ name: 株価・出来高 取得
 on:
   schedule:
     # 平日 17:00 JST = 08:00 UTC（東証大引け15:30から余裕を見て設定）
-    - cron: "0 8 * * 1-5"
+    - cron: "45 7 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
