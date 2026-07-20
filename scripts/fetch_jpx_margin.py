@@ -111,6 +111,53 @@ def download_pdf(date_yyyymmdd: str) -> bytes:
 
 
 ISIN_PATTERN = re.compile(r"JP[A-Z0-9]{10}")
+NUMBER_PATTERN = re.compile(r"(▲?)\s*(\d{1,3}(?:,\d{3})*)")
+
+# 小計・総合計行は、JPXの公表フォーマット上この固定順で現れる
+# （2026/7/10申込分のPDFで実データ確認済み）。
+# 件数が一致しない場合は書式変更とみなし、集計行の書き込みはスキップする。
+SUBTOTAL_LABELS = [
+    "貸借銘柄 プライム 小計",
+    "貸借銘柄 スタンダード 小計",
+    "貸借銘柄 グロース 小計",
+    "貸借銘柄 投信等 小計",
+    "制度信用銘柄 プライム 小計",
+    "制度信用銘柄 スタンダード 小計",
+    "制度信用銘柄 グロース 小計",
+    "制度信用銘柄 投信等 小計",
+    "その他 合計",
+    "その他 プライム 小計",
+    "その他 スタンダード 小計",
+    "その他 グロース 小計",
+    "総合計",
+    "全体 プライム 小計",
+    "全体 スタンダード 小計",
+    "全体 グロース 小計",
+    "全体 投信等 小計",
+]
+
+
+def _parse_subtotal_line(line: str):
+    """
+    小計・総合計行から12個の数値を抽出する。
+    数値同士がスペースなしで連結していることがあるが、
+    3桁区切りカンマのパターンで正しく分割できる。
+    データ行でなければ None を返す。
+    """
+    m = re.search(r"(\d+)\s*銘柄", line)
+    if not m:
+        return None
+    tail = line[m.end():]
+    numbers = []
+    for nm in NUMBER_PATTERN.finditer(tail):
+        sign, digits = nm.groups()
+        if not digits:
+            continue
+        val = float(digits.replace(",", ""))
+        numbers.append(-val if sign else val)
+    if len(numbers) < 12:
+        return None
+    return numbers[:12]
 
 
 def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
@@ -124,12 +171,14 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
       売残高(一般信用) 前週比 売残高(制度信用) 前週比
       買残高(一般信用) 前週比 買残高(制度信用) 前週比
 
-    合計値はここでは計算しない（別シートでユーザー側が算出するため）。
-    数値中の「▲」は負の値としてパースする（_parse_signed_tokensで対応済み）。
+    銘柄行の他に、小計・総合計行（SUBTOTAL_LABELS）も
+    銘柄コード "SUB00"〜"SUB16" の特別行として先頭に含める。
+    合計値はここでは計算しない（PDFに実際に記載された小計・総合計値をそのまま使う）。
+    数値中の「▲」は負の値としてパースする。
     """
     records = []
+    subtotal_rows_raw = []
     skipped = 0
-    subtotal_candidate_lines = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         print(f"  総ページ数: {len(pdf.pages)}")
@@ -138,10 +187,9 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             for line in text.split("\n"):
                 m = ISIN_PATTERN.search(line)
                 if not m:
-                    # ISINを含まない行のうち、小計・合計・区分見出しらしきものを収集
-                    # （次のステップで小計/総合計行を正しくパースするための調査用）
-                    if any(kw in line for kw in ("小計", "合計", "プライム", "スタンダード", "グロース", "その他")):
-                        subtotal_candidate_lines.append(line)
+                    parsed = _parse_subtotal_line(line)
+                    if parsed:
+                        subtotal_rows_raw.append(parsed)
                     continue  # ISINを含まない行（見出し・区切り等）はスキップ
 
                 before = line[: m.start()].strip()
@@ -183,23 +231,42 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                     }
                 )
 
-        # --- デバッグ出力: 小計/総合計/区分見出しらしき行を全部出す ---
-        print(f"  DEBUG: 小計/総合計/区分見出し候補行 {len(subtotal_candidate_lines)} 件:")
-        for l in subtotal_candidate_lines:
-            print(f"    {l!r}")
-        # --- デバッグここまで ---
-
-    df = pd.DataFrame(records)
-    print(f"  抽出件数: {len(df)} 銘柄（パース失敗でスキップ: {skipped} 行）")
-    if df.empty:
+    stock_df = pd.DataFrame(records)
+    print(f"  抽出件数: {len(stock_df)} 銘柄（パース失敗でスキップ: {skipped} 行）")
+    if stock_df.empty:
         raise ValueError("PDFから銘柄データを抽出できませんでした。レイアウトが変わった可能性があります。")
 
     # 銘柄コード順（数値の昇順）にソート。
     # これにより初回書き込み時の行順が揃い、以後の週で新規上場銘柄は
     # 既存コードに一致しないため自動的に末尾へ追加される。
-    df["_code_sort"] = pd.to_numeric(df["銘柄コード"], errors="coerce")
-    df = df.sort_values("_code_sort", na_position="last").drop(columns="_code_sort").reset_index(drop=True)
+    stock_df["_sort_key"] = pd.to_numeric(stock_df["銘柄コード"], errors="coerce")
 
+    print(f"  小計/総合計行の検出数: {len(subtotal_rows_raw)} 件（期待値: {len(SUBTOTAL_LABELS)} 件）")
+
+    if len(subtotal_rows_raw) == len(SUBTOTAL_LABELS):
+        summary_records = []
+        for i, (values, label) in enumerate(zip(subtotal_rows_raw, SUBTOTAL_LABELS)):
+            general_sell, standard_sell = values[4], values[6]
+            general_buy, standard_buy = values[8], values[10]
+            summary_records.append(
+                {
+                    "銘柄コード": f"SUB{i:02d}",
+                    "銘柄名": label,
+                    "一般信用買残高": general_buy,
+                    "一般信用売残高": general_sell,
+                    "制度信用買残高": standard_buy,
+                    "制度信用売残高": standard_sell,
+                    # 実銘柄コードより必ず前に来るよう非常に小さい値にする
+                    "_sort_key": i - 1000,
+                }
+            )
+        summary_df = pd.DataFrame(summary_records)
+        df = pd.concat([summary_df, stock_df], ignore_index=True)
+    else:
+        print("  警告: 小計/総合計行の件数が想定と異なるため、集計行の書き込みをスキップします。")
+        df = stock_df
+
+    df = df.sort_values("_sort_key", na_position="last").drop(columns="_sort_key").reset_index(drop=True)
     return df
 
 
