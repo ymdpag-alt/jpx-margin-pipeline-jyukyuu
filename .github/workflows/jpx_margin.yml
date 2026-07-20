@@ -2,8 +2,8 @@ name: JPX信用取引週末残高 取得
 
 on:
   schedule:
-    # 毎週火曜 18:00 JST = 09:00 UTC（公表は16:30目安なので余裕を見て設定）
-    - cron: "0 9 * * 2"
+    # 毎週火曜 17:20 JST = 09:00 UTC（公表は16:30目安なので余裕を見て設定）
+    - cron: "20 8 * * 2"
   workflow_dispatch:
     inputs:
       target_date:
