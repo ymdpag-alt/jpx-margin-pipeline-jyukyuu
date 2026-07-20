@@ -232,7 +232,19 @@ def authenticate_google_sheets() -> gspread.Client:
     creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     import json
 
-    info = json.loads(creds_json)
+    # --- デバッグ: 中身は伏せつつ、長さと先頭・末尾だけ出力して原因を特定する ---
+    print(f"  DEBUG: GOOGLE_SERVICE_ACCOUNT_JSON の文字数: {len(creds_json)}")
+    print(f"  DEBUG: 先頭10文字: {creds_json[:10]!r}")
+    print(f"  DEBUG: 末尾10文字: {creds_json[-10:]!r}")
+    print(f"  DEBUG: 改行の数: {creds_json.count(chr(10))}")
+    # --- デバッグここまで ---
+
+    try:
+        info = json.loads(creds_json)
+    except json.JSONDecodeError as e:
+        print(f"  DEBUG: JSONパース失敗の詳細: {e}")
+        raise
+
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
