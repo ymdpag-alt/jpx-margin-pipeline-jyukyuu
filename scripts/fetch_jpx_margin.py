@@ -178,6 +178,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
     records = []
     subtotal_rows_raw = []
+    subtotal_debug_lines = []  # 検出行の元テキスト（件数不一致時の原因調査用）
     skipped = 0
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -190,6 +191,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                     parsed = _parse_subtotal_line(line)
                     if parsed:
                         subtotal_rows_raw.append(parsed)
+                        subtotal_debug_lines.append(line)
                     continue  # ISINを含まない行（見出し・区切り等）はスキップ
 
                 before = line[: m.start()].strip()
@@ -242,6 +244,10 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     stock_df["_sort_key"] = pd.to_numeric(stock_df["銘柄コード"], errors="coerce")
 
     print(f"  小計/総合計行の検出数: {len(subtotal_rows_raw)} 件（期待値: {len(SUBTOTAL_LABELS)} 件）")
+    if len(subtotal_rows_raw) != len(SUBTOTAL_LABELS):
+        print("  DEBUG: 検出された小計/総合計行の一覧（原因調査用）:")
+        for i, l in enumerate(subtotal_debug_lines):
+            print(f"    [{i}] {l!r}")
 
     if len(subtotal_rows_raw) == len(SUBTOTAL_LABELS):
         summary_records = []
