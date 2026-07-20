@@ -1,0 +1,4 @@
+yfinance==0.2.51 
+gspread==6.1.4 
+pandas==2.2.3 
+numpy==2.1.3 
