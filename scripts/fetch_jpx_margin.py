@@ -129,6 +129,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
     records = []
     skipped = 0
+    subtotal_candidate_lines = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         print(f"  総ページ数: {len(pdf.pages)}")
@@ -137,6 +138,10 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             for line in text.split("\n"):
                 m = ISIN_PATTERN.search(line)
                 if not m:
+                    # ISINを含まない行のうち、小計・合計・区分見出しらしきものを収集
+                    # （次のステップで小計/総合計行を正しくパースするための調査用）
+                    if any(kw in line for kw in ("小計", "合計", "プライム", "スタンダード", "グロース", "その他")):
+                        subtotal_candidate_lines.append(line)
                     continue  # ISINを含まない行（見出し・区切り等）はスキップ
 
                 before = line[: m.start()].strip()
@@ -178,10 +183,23 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                     }
                 )
 
+        # --- デバッグ出力: 小計/総合計/区分見出しらしき行を全部出す ---
+        print(f"  DEBUG: 小計/総合計/区分見出し候補行 {len(subtotal_candidate_lines)} 件:")
+        for l in subtotal_candidate_lines:
+            print(f"    {l!r}")
+        # --- デバッグここまで ---
+
     df = pd.DataFrame(records)
     print(f"  抽出件数: {len(df)} 銘柄（パース失敗でスキップ: {skipped} 行）")
     if df.empty:
         raise ValueError("PDFから銘柄データを抽出できませんでした。レイアウトが変わった可能性があります。")
+
+    # 銘柄コード順（数値の昇順）にソート。
+    # これにより初回書き込み時の行順が揃い、以後の週で新規上場銘柄は
+    # 既存コードに一致しないため自動的に末尾へ追加される。
+    df["_code_sort"] = pd.to_numeric(df["銘柄コード"], errors="coerce")
+    df = df.sort_values("_code_sort", na_position="last").drop(columns="_code_sort").reset_index(drop=True)
+
     return df
 
 
@@ -249,15 +267,18 @@ def authenticate_google_sheets() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def get_or_create_worksheet(gc: gspread.Client, sheet_name: str, min_cols: int = 50):
+def get_or_create_worksheet(gc: gspread.Client, sheet_name: str, min_cols: int = 50, min_rows: int = 100):
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
     try:
         ws = spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         print(f"  シート '{sheet_name}' を新規作成します")
-        ws = spreadsheet.add_worksheet(title=sheet_name, rows=3000, cols=min_cols)
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=max(min_rows, 100), cols=min_cols)
     if ws.col_count < min_cols:
         ws.add_cols(min_cols - ws.col_count)
+        ws = spreadsheet.worksheet(sheet_name)
+    if ws.row_count < min_rows:
+        ws.add_rows(min_rows - ws.row_count)
         ws = spreadsheet.worksheet(sheet_name)
     return ws
 
@@ -322,8 +343,9 @@ def update_spreadsheet_single_column(
         print(f"  [{sheet_name}] 新規銘柄を追加: {len(new_rows)} 件")
         start_row = len(existing) + 1
         total_cols = len(header) + 1
-        ws = get_or_create_worksheet(gc, sheet_name, min_cols=total_cols)
-        end_a1 = gspread.utils.rowcol_to_a1(start_row + len(new_rows) - 1, total_cols)
+        end_row = start_row + len(new_rows) - 1
+        ws = get_or_create_worksheet(gc, sheet_name, min_cols=total_cols, min_rows=end_row)
+        end_a1 = gspread.utils.rowcol_to_a1(end_row, total_cols)
         ws.update(values=new_rows, range_name=f"A{start_row}:{end_a1}", value_input_option="USER_ENTERED")
 
     print(f"  [{sheet_name}] 書き込み完了！")
