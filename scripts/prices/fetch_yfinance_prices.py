@@ -214,8 +214,21 @@ def fetch_stock_data(
             )
         except Exception as e:
             print(f"  [{chunk_num}/{total_chunks}] ⚠ ダウンロード失敗: {e}")
+            if chunk_num == 1:
+                import traceback
+                print("  DEBUG: 例外の詳細:")
+                traceback.print_exc()
             time.sleep(SLEEP_TIME)
             continue
+
+        if chunk_num == 1:
+            print(f"  DEBUG: raw is None: {raw is None}")
+            if raw is not None:
+                print(f"  DEBUG: raw.shape: {raw.shape}")
+                print(f"  DEBUG: raw.empty: {raw.empty}")
+                print(f"  DEBUG: raw.columns[:10]: {list(raw.columns[:10])}")
+                print(f"  DEBUG: raw.index[-5:]: {list(raw.index[-5:])}")
+                print(f"  DEBUG: start={start} end={end}")
 
         if raw is None or raw.empty:
             print(f"  [{chunk_num}/{total_chunks}] データ0件（休場・未確定・取得制限の可能性）")
@@ -244,6 +257,10 @@ def fetch_stock_data(
         if getattr(idx, "tz", None) is not None:
             idx = idx.tz_localize(None)
         date_to_pos = {ts.date(): pos for pos, ts in enumerate(idx)}
+
+        if chunk_num == 1:
+            print(f"  DEBUG: date_to_posのキー(取得できた日付一覧): {sorted(date_to_pos.keys())}")
+            print(f"  DEBUG: target_date_mapのキー(探している日付): {sorted(target_date_map.keys())}")
 
         filled_chunk = 0
         for ticker in chunk:
