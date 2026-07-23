@@ -181,7 +181,10 @@ def fetch_stock_data(
         data_type: "Volume"（出来高）または "Close"（終値）
     """
     tickers = [f"{c}.T" for c in codes]
-    start = min(target_dates)
+    # yfinanceは start〜end の範囲が狭すぎる（特に1日だけ）と、
+    # 実際にはデータがある日でも0件を返すことがある既知の癖があるため、
+    # 取得範囲は前後に余裕を持たせ、対象日の行だけを後で拾う。
+    start = str(pd.to_datetime(min(target_dates)) - pd.Timedelta(days=7))[:10]
     end = str(pd.to_datetime(max(target_dates)) + pd.Timedelta(days=1))[:10]
     label = "出来高" if data_type == "Volume" else "終値"
     total_chunks = (len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
