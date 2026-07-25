@@ -28,8 +28,8 @@ CODE_PATTERN = re.compile(r"^\d[0-9A-Za-z]{3}$")
 # 取得日付の設定 -----------------------------------------------------------
 # None のままにすると実行当日（日本時間）を自動使用
 # 日付を指定したい場合は文字列で書き換える（コメントアウトを外す）
-#　TARGET_DATE_OVERRIDE: str | None = None
-TARGET_DATE_OVERRIDE = "2026-07-24"
+TARGET_DATE_OVERRIDE: str | None = None
+# TARGET_DATE_OVERRIDE = "2026-07-24"
 
 TARGET_DATES = (
     [TARGET_DATE_OVERRIDE]
@@ -482,17 +482,24 @@ def sort_date_columns(gc: gspread.Client, gid: int):
 # =============================================================================
 
 def smoke_test(start: str, end: str) -> None:
-    """本処理の前に、Yahoo がこのrunnerをブロックしていないかを判定する。"""
-    log("\n[疎通確認] 7203.T を単独取得...")
+    """本処理の前に Yahoo からデータを取得できる状態かを確認する。"""
+    log(f"\n[疎通確認] 7203.T を単独取得... (yfinance {yf.__version__})")
     raw = _download_with_retry(["7203.T"], start, end)
     if raw is None or raw.empty:
         die(
-            "疎通確認に失敗しました。Yahoo Finance がこのIPを制限しています。"
-            "時間をずらして再実行するか、ローカル実行への移行を検討してください。"
+            "疎通確認に失敗しました。考えられる原因:\n"
+            "  (1) yfinance が古い（0.2.51以前）→ pip install --upgrade yfinance curl_cffi\n"
+            "  (2) Yahoo Finance のIP制限         → 時間をおいて再実行\n"
+            "  (3) 対象期間に営業日がない         → TARGET_DATE_OVERRIDE を確認\n"
+            f"  現在のバージョン: yfinance {yf.__version__}"
         )
     sub = _extract_field(raw, "Close", ["7203.T"])
     if sub is None or sub.dropna(how="all").empty:
-        die("疎通確認: 終値が全てNaNでした。レート制限の可能性が高いです。")
+        die(
+            "疎通確認: 終値が全てNaNでした。\n"
+            "  yfinance のアップグレードを試してください: "
+            "pip install --upgrade yfinance curl_cffi"
+        )
     log(f"  OK: {len(sub.dropna(how='all'))} 営業日分の終値を取得")
 
 
