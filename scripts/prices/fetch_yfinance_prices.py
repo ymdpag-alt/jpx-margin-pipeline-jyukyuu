@@ -41,8 +41,8 @@ TARGET_DATES = (
 # ---- API制御（環境変数で上書き可）------------------------------------------
 # yf.download は「銘柄ごとに1リクエスト」を投げるため、CHUNK_SIZE は
 # 「同時に投げる本数」を意味する。大きくすると即座にレート制限に掛かる。
-CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "20"))
-SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "2.0"))
+CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "40"))
+SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "1.0"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "8.0"))
 
