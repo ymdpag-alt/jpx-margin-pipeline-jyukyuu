@@ -41,9 +41,9 @@ TARGET_DATES = (
 
 # ---- API制御（環境変数で上書き可）------------------------------------------
 CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "50"))
-SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "1.0"))
+SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "0.7"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
-BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "8.0"))
+BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "6.0"))
 
 MAX_CODES = int(os.environ.get("MAX_CODES", "0"))
 
