@@ -29,7 +29,7 @@ CODE_PATTERN = re.compile(r"^\d[0-9A-Za-z]{3}$")
 # None のままにすると実行当日（日本時間）を自動使用
 # 日付を指定したい場合は文字列で書き換える（コメントアウトを外す）
 # TARGET_DATE_OVERRIDE: str | None = None
-TARGET_DATE_OVERRIDE = "2026-07-24"
+ TARGET_DATE_OVERRIDE = "2026-07-24"
 
 TARGET_DATES = (
     [TARGET_DATE_OVERRIDE]
@@ -39,20 +39,16 @@ TARGET_DATES = (
 # -------------------------------------------------------------------------
 
 # ---- API制御（環境変数で上書き可）------------------------------------------
-# yf.download は「銘柄ごとに1リクエスト」を投げるため、CHUNK_SIZE は
-# 「同時に投げる本数」を意味する。大きくすると即座にレート制限に掛かる。
-CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "40"))
+CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "50"))
 SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "1.0"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "8.0"))
 
-# 対象銘柄の上限（0 = 制限なし）。Actions上では絞ることを強く推奨。
 MAX_CODES = int(os.environ.get("MAX_CODES", "0"))
 
-# 品質ゲート: 取得率がこれ未満ならシートに一切書き込まず異常終了する
 MIN_FILL_RATE = float(os.environ.get("MIN_FILL_RATE", "0.50"))
 
-# 連続で空振りしたチャンク数がこれを超えたら、レート制限とみなして即中断
+# 連続空振りがこの回数を超えたらスキップして書き込みへ進む（die しない）
 ABORT_AFTER_EMPTY_CHUNKS = int(os.environ.get("ABORT_AFTER_EMPTY_CHUNKS", "3"))
 
 FIXED_COLS = 2
@@ -164,7 +160,6 @@ def load_stock_codes_from_sheet(gc: gspread.Client, gid: int) -> list[str]:
 # =============================================================================
 
 def _download_with_retry(chunk: list[str], start: str, end: str):
-    """1チャンクをリトライ付きでダウンロードする。失敗内容は必ずログに出す。"""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         raw = None
         try:
@@ -175,10 +170,10 @@ def _download_with_retry(chunk: list[str], start: str, end: str):
                 progress=False,
                 auto_adjust=False,
                 group_by="column",
-                threads=False,   # 同時接続を作らない（429対策の要）
+                threads=False,
                 timeout=45,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log(f"    [attempt {attempt}/{MAX_ATTEMPTS}] {type(e).__name__}: {e}")
 
         if raw is not None and not raw.empty:
@@ -192,7 +187,6 @@ def _download_with_retry(chunk: list[str], start: str, end: str):
 
 
 def _extract_field(raw: pd.DataFrame, field: str, chunk: list[str]):
-    """download結果から指定フィールドを DataFrame(index=日付, columns=ティッカー) で取り出す。"""
     cols = raw.columns
     if isinstance(cols, pd.MultiIndex):
         if field in set(cols.get_level_values(0)):
@@ -214,14 +208,6 @@ def _extract_field(raw: pd.DataFrame, field: str, chunk: list[str]):
 
 
 def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
-    """
-    終値と出来高を「1回のダウンロード」でまとめて取得する。
-    （旧コードは Volume と Close で2回ダウンロードしており、
-      Yahoo へのリクエスト数が倍になっていた）
-
-    Returns:
-        {"Close": {date: {code: value}}, "Volume": {...}}
-    """
     tickers = [f"{c}.T" for c in codes]
     start = str(pd.to_datetime(min(target_dates)) - pd.Timedelta(days=7))[:10]
     end = str(pd.to_datetime(max(target_dates)) + pd.Timedelta(days=1))[:10]
@@ -246,11 +232,14 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
             consecutive_empty += 1
             log(f"  [{chunk_num}/{total_chunks}] 取得0件")
             if consecutive_empty >= ABORT_AFTER_EMPTY_CHUNKS:
-                die(
-                    f"{consecutive_empty}チャンク連続で取得できませんでした。"
-                    "Yahoo Finance がこのIPをレート制限している可能性が高いです。"
-                    "シートは変更していません。"
+                # ↓ die() → break に変更
+                # 未上場コード等で後半が空になっても取得済みデータを書き込む
+                log(
+                    f"  ⚠ {consecutive_empty}チャンク連続で取得できませんでした。"
+                    f"（未上場コード or レート制限）"
+                    f"残り {total_chunks - chunk_num} チャンクをスキップして書き込みへ進みます。"
                 )
+                break
             time.sleep(SLEEP_TIME * 2)
             continue
 
@@ -259,7 +248,6 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
             log(f"  DEBUG columns[:6] : {list(raw.columns[:6])}")
             log(f"  DEBUG index[-5:]  : {[str(x)[:10] for x in raw.index[-5:]]}")
 
-        # index を date 化
         idx = raw.index
         if getattr(idx, "tz", None) is not None:
             idx = idx.tz_localize(None)
@@ -297,13 +285,15 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
 
         if filled_chunk == 0:
             consecutive_empty += 1
-            log(f"  [{chunk_num}/{total_chunks}] {len(chunk)}銘柄中 0件（全てNaN＝レート制限の疑い）")
+            log(f"  [{chunk_num}/{total_chunks}] {len(chunk)}銘柄中 0件（未上場コード or レート制限）")
             if consecutive_empty >= ABORT_AFTER_EMPTY_CHUNKS:
-                die(
-                    f"{consecutive_empty}チャンク連続で値が全てNaNでした。"
-                    "Yahoo Finance がこのIPをレート制限している可能性が高いです。"
-                    "シートは変更していません。"
+                # ↓ die() → break に変更
+                # 600A系など Yahoo 未対応コードが後半に固まっていても止まらない
+                log(
+                    f"  ⚠ {consecutive_empty}チャンク連続で空データ。"
+                    f"残り {total_chunks - chunk_num} チャンクをスキップして書き込みへ進みます。"
                 )
+                break
         else:
             consecutive_empty = 0
             log(f"  [{chunk_num}/{total_chunks}] {len(chunk)}銘柄中 {filled_chunk}件 取得")
@@ -323,7 +313,6 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
 
 
 def build_dataframe(codes: list[str], values: dict, target_dates: list[str]) -> pd.DataFrame:
-    """{date: {code: value}} を シート書き込み用の DataFrame に整形する。"""
     df = pd.DataFrame({"銘柄コード": codes, "備考": ""})
     for d in target_dates:
         df[d] = df["銘柄コード"].map(values.get(d, {}))
@@ -352,7 +341,6 @@ def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
     df_date_cols = list(df.columns[FIXED_COLS:])
     iso_to_jp = {d: to_japanese_date(d) for d in df_date_cols}
 
-    # 中身が全て空の日付列は書き込まない（空列でシートを汚さないため）
     non_empty = [d for d in df_date_cols if df[d].notna().any()]
     skipped = [d for d in df_date_cols if d not in non_empty]
     if skipped:
@@ -362,7 +350,6 @@ def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
         return
     df_date_cols = non_empty
 
-    # --- 初回書き込み ---
     if not existing:
         log("  初回書き込み")
         header = list(df.columns[:FIXED_COLS]) + [iso_to_jp[c] for c in df_date_cols]
@@ -373,9 +360,7 @@ def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
                   value_input_option="USER_ENTERED")
         return
 
-    # --- 追記モード ---
     header = existing[0]
-    # index() の線形探索を辞書化（4900行×4900回のO(n^2)を解消）
     code_to_row = {}
     for r, row in enumerate(existing[1:], start=2):
         if row and row[0]:
@@ -407,7 +392,7 @@ def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
         code = str(row["銘柄コード"])
         values = [to_native(row[d]) for d in new_cols_iso]
         if all(v == "" for v in values):
-            continue  # 値が無い銘柄はAPI呼び出しごと省略
+            continue
         row_idx = code_to_row.get(code)
         if row_idx:
             cell_range = (
@@ -482,7 +467,6 @@ def sort_date_columns(gc: gspread.Client, gid: int):
 # =============================================================================
 
 def smoke_test(start: str, end: str) -> None:
-    """本処理の前に Yahoo からデータを取得できる状態かを確認する。"""
     log(f"\n[疎通確認] 7203.T を単独取得... (yfinance {yf.__version__})")
     raw = _download_with_retry(["7203.T"], start, end)
     if raw is None or raw.empty:
@@ -490,16 +474,11 @@ def smoke_test(start: str, end: str) -> None:
             "疎通確認に失敗しました。考えられる原因:\n"
             "  (1) yfinance が古い（0.2.51以前）→ pip install --upgrade yfinance curl_cffi\n"
             "  (2) Yahoo Finance のIP制限         → 時間をおいて再実行\n"
-            "  (3) 対象期間に営業日がない         → TARGET_DATE_OVERRIDE を確認\n"
             f"  現在のバージョン: yfinance {yf.__version__}"
         )
     sub = _extract_field(raw, "Close", ["7203.T"])
     if sub is None or sub.dropna(how="all").empty:
-        die(
-            "疎通確認: 終値が全てNaNでした。\n"
-            "  yfinance のアップグレードを試してください: "
-            "pip install --upgrade yfinance curl_cffi"
-        )
+        die("疎通確認: 終値が全てNaNでした。pip install --upgrade yfinance curl_cffi を試してください。")
     log(f"  OK: {len(sub.dropna(how='all'))} 営業日分の終値を取得")
 
 
@@ -524,7 +503,6 @@ def main():
     end = str(pd.to_datetime(max(TARGET_DATES)) + pd.Timedelta(days=1))[:10]
     smoke_test(start, end)
 
-    # 終値と出来高を1回の走査でまとめて取得（リクエスト数が従来の半分）
     values = fetch_prices(codes, TARGET_DATES)
 
     log("\n" + "=" * 50)
