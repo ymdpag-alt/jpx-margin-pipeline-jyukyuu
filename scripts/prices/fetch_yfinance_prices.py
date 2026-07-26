@@ -28,9 +28,9 @@ CODE_PATTERN = re.compile(r"^\d[0-9A-Za-z]{3}$")
 # 取得日付の設定 -----------------------------------------------------------
 # None のままにすると実行当日（日本時間）を自動使用
 # 日付を指定したい場合は文字列で書き換える（コメントアウトを外す）
-# TARGET_DATE_OVERRIDE: str | None = None
+TARGET_DATE_OVERRIDE: str | None = None
 
-TARGET_DATE_OVERRIDE = "2026-07-24"
+# TARGET_DATE_OVERRIDE = "2026-07-24"
 
 TARGET_DATES = (
     [TARGET_DATE_OVERRIDE]
@@ -40,7 +40,7 @@ TARGET_DATES = (
 # -------------------------------------------------------------------------
 
 # ---- API制御（環境変数で上書き可）------------------------------------------
-CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "50"))
+CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "70"))
 SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "0.7"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "6.0"))
