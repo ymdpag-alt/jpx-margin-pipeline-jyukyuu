@@ -16,8 +16,23 @@ from zoneinfo import ZoneInfo
 
 SPREADSHEET_ID = "1QheVVw97DnHjdymEYNFwvgiQhgX8SX-bPxjlHmZpG2I"
 
-VOLUME_SHEET_GID = 328764273     # 出来高
+# ---- 各データ種別ごとのタブ (gid) --------------------------------------------
+OPEN_SHEET_GID   = 1348359438    # 始値
+HIGH_SHEET_GID   = 13194030      # 高値
+LOW_SHEET_GID    = 876490713     # 安値
 CLOSE_SHEET_GID  = 2080765326    # 終値
+VOLUME_SHEET_GID = 328764273     # 出来高
+
+# yfinance のフィールド名 → (書き込み先gid, 日本語ラベル, ログ見出し)
+FIELD_CONFIG = {
+    "Open":   {"gid": OPEN_SHEET_GID,   "label_jp": "始値", "heading": "【始値データ】"},
+    "High":   {"gid": HIGH_SHEET_GID,   "label_jp": "高値", "heading": "【高値データ】"},
+    "Low":    {"gid": LOW_SHEET_GID,    "label_jp": "安値", "heading": "【安値データ】"},
+    "Close":  {"gid": CLOSE_SHEET_GID,  "label_jp": "終値", "heading": "【終値データ】"},
+    "Volume": {"gid": VOLUME_SHEET_GID, "label_jp": "出来高", "heading": "【出来高データ】"},
+}
+# 取得・書き込みを行うフィールド一覧（この順で処理される）
+FIELDS = ["Open", "High", "Low", "Close", "Volume"]
 
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
 
@@ -209,6 +224,11 @@ def _extract_field(raw: pd.DataFrame, field: str, chunk: list[str]):
 
 
 def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
+    """始値・高値・安値・終値・出来高の5項目を取得する。
+
+    yf.download は1回の呼び出しで OHLCV をまとめて返すため、
+    追加のAPIコストなしに Open/High/Low を Close/Volume と同時に取得できる。
+    """
     tickers = [f"{c}.T" for c in codes]
     start = str(pd.to_datetime(min(target_dates)) - pd.Timedelta(days=7))[:10]
     end = str(pd.to_datetime(max(target_dates)) + pd.Timedelta(days=1))[:10]
@@ -217,9 +237,9 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
     total_chunks = (len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
     log(f"\n株価データ取得中（{len(codes)}銘柄 / {CHUNK_SIZE}銘柄ずつ / {total_chunks}チャンク）")
     log(f"  期間: {start} 〜 {end}（対象日: {', '.join(target_dates)}）")
+    log(f"  取得項目: {', '.join(FIELDS)}")
 
-    results = {"Close": {d: {} for d in target_dates},
-               "Volume": {d: {} for d in target_dates}}
+    results = {field: {d: {} for d in target_dates} for field in FIELDS}
     filled_codes: set[str] = set()
     consecutive_empty = 0
 
@@ -262,7 +282,7 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
                 log(f"  ⚠ 対象日が取得範囲に存在しません: {missing}")
 
         filled_chunk = 0
-        for field in ("Close", "Volume"):
+        for field in FIELDS:
             sub = _extract_field(raw, field, chunk)
             if sub is None:
                 log(f"  [{chunk_num}/{total_chunks}] ⚠ '{field}' 列が見つからず")
@@ -506,25 +526,22 @@ def main():
 
     values = fetch_prices(codes, TARGET_DATES)
 
-    log("\n" + "=" * 50)
-    log("【出来高データ】")
-    log("=" * 50)
-    vol_df = build_dataframe(codes, values["Volume"], TARGET_DATES)
-    update_spreadsheet(gc, vol_df, VOLUME_SHEET_GID)
-    sort_date_columns(gc, VOLUME_SHEET_GID)
-
-    log("\n" + "=" * 50)
-    log("【終値データ】")
-    log("=" * 50)
-    close_df = build_dataframe(codes, values["Close"], TARGET_DATES)
-    update_spreadsheet(gc, close_df, CLOSE_SHEET_GID)
-    sort_date_columns(gc, CLOSE_SHEET_GID)
+    # 始値・高値・安値・終値・出来高を、それぞれ対応するタブへ書き込む
+    for field in FIELDS:
+        cfg = FIELD_CONFIG[field]
+        log("\n" + "=" * 50)
+        log(cfg["heading"])
+        log("=" * 50)
+        field_df = build_dataframe(codes, values[field], TARGET_DATES)
+        update_spreadsheet(gc, field_df, cfg["gid"])
+        sort_date_columns(gc, cfg["gid"])
 
     log("\n" + "=" * 50)
     log("全処理完了！")
     log(f"  スプレッドシートID : {SPREADSHEET_ID}")
     log(f"  銘柄数             : {len(codes)}")
     log(f"  取得日付           : {', '.join(TARGET_DATES)}")
+    log(f"  取得項目           : {', '.join(FIELD_CONFIG[f]['label_jp'] for f in FIELDS)}")
     log("=" * 50)
 
 
