@@ -16,7 +16,7 @@ jobs:
     #   リポジトリ直下に配置している場合はこの2行（defaults:〜working-directory:〜）を削除してOKです。
     defaults:
       run:
-        working-directory: scripts   
+        working-directory: scripts/業種別空売り
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
