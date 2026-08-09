@@ -1,31 +1,36 @@
 name: JPX 空売り業種別集計 取得
- 
+
 on:
   schedule:
     # 毎週月〜金 21:30 JST (= 12:30 UTC) に実行
     # JPXの空売り集計は通常その日の夜に公開されるため、公開後の時間帯を想定。
     # 実際の公開タイミングを見ながら適宜調整してください。
-    - cron: "40 8 * * 1-5"
+    - cron: "30 12 * * 1-5"
   workflow_dispatch: {}  # 手動実行用
- 
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # ↓ スクリプト一式をリポジトリ直下ではなくサブフォルダに置いている場合はこの行を使う。
+    #   フォルダ名が異なる場合は "jpx_short_selling" の部分を実際のフォルダ名に変更してください。
+    #   リポジトリ直下に配置している場合はこの2行（defaults:〜working-directory:〜）を削除してOKです。
+    defaults:
+      run:
+        working-directory: scripts   
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
- 
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
- 
+
       - name: Install dependencies
         run: pip install -r requirements.txt
- 
+
       - name: Run JPX short-selling scraper
         env:
           JPX_SPREADSHEET_ID: ${{ secrets.JPX_SPREADSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python jpx_short_selling_scraper.py
- 
