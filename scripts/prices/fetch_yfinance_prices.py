@@ -55,14 +55,14 @@ TARGET_DATES = (
 # -------------------------------------------------------------------------
 
 # ---- API制御（環境変数で上書き可）------------------------------------------
-CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "70"))
-SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "0.7"))
+CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "85"))
+SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "0.5"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
-BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "6.0"))
+BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "5.0"))
 
 MAX_CODES = int(os.environ.get("MAX_CODES", "0"))
 
-MIN_FILL_RATE = float(os.environ.get("MIN_FILL_RATE", "0.50"))
+MIN_FILL_RATE = float(os.environ.get("MIN_FILL_RATE", "0.30"))
 
 # 連続空振りがこの回数を超えたらスキップして書き込みへ進む（die しない）
 ABORT_AFTER_EMPTY_CHUNKS = int(os.environ.get("ABORT_AFTER_EMPTY_CHUNKS", "3"))
