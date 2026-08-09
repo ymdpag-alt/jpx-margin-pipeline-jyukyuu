@@ -5,6 +5,11 @@ JPX 空売り集計（業種別集計）日次データ → Googleスプレッ�
 
 取得元 : https://www.jpx.co.jp/markets/statistics-equities/short-selling/index.html
 環境変数: GOOGLE_SERVICE_ACCOUNT_JSON（サービスアカウントJSONの中身をそのまま）
+
+日付指定（省略時は最新）:
+  コマンドライン : python jpx_short_selling_scraper.py 2026/08/05
+  環境変数       : TARGET_DATE=2026/08/05 python jpx_short_selling_scraper.py
+  ※ JPXの一覧ページには直近5営業日分しか掲載されないため、それより古い日付は取得不可。
 """
 
 import io
@@ -41,10 +46,10 @@ SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
 
 #   PDFカテゴリ(a/b/c/d) → 書き込み先シートGID
 SHEET_MAP = {
-    "a": {"gid": 162001397,  "name": "空売り（実注文"},
+    "a": {"gid": 162001397,  "name": "実注文"},
     "b": {"gid": 692441937,  "name": "空売り（価格規制あり）"},
     "c": {"gid": 1306991615, "name": "空売り（価格規制なし）"},
-    "d": {"gid": 668166970,  "name": "空売り（合計"},
+    "d": {"gid": 668166970,  "name": "合計"},
 }
 
 GOOGLE_SCOPES = [
@@ -89,8 +94,12 @@ DATE_RE = re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
 #  PDF 取得・パース
 # ================================================================
 
-def get_latest_pdf_url() -> str:
-    """一覧ページから最新日付の「業種別集計」PDF URL を取得する。"""
+def get_pdf_url(target_date: Optional[str] = None) -> str:
+    """
+    一覧ページから業種別集計PDF URLを取得する。
+    target_date が None なら最新日付、"YYYY/MM/DD" 形式で指定すると該当日付を返す。
+    ※ 一覧には直近5営業日分のみ掲載。それより古い日付はエラーになる。
+    """
     resp = requests.get(JPX_INDEX_URL, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding
@@ -100,21 +109,36 @@ def get_latest_pdf_url() -> str:
     if not table:
         raise RuntimeError("一覧テーブルが見つかりません。サイト構造が変更された可能性があります。")
 
-    # リンクを含む先頭行 = 最新日付
-    data_rows = [r for r in table.find_all("tr") if r.find_all("a")]
-    if not data_rows:
+    # テーブルの全行を {日付: URL} でマッピング
+    date_url_map = {}
+    for row in table.find_all("tr"):
+        links = row.find_all("a")
+        cells = row.find_all("td")
+        if not links or not cells:
+            continue
+        date_text = cells[0].get_text(strip=True)  # 例: "2026/08/07"
+        href = next(
+            (a.get("href", "") for a in links if "-g.pdf" in a.get("href", "")),
+            links[1].get("href") if len(links) >= 2 else None,
+        )
+        if date_text and href:
+            date_url_map[date_text] = href if href.startswith("http") else JPX_BASE_URL + href
+
+    if not date_url_map:
         raise RuntimeError("PDFリンクを含む行が見つかりませんでした。")
 
-    links = data_rows[0].find_all("a")
-    # ファイル名が "-g.pdf" で終わるものが「業種別集計」
-    href = next(
-        (a.get("href", "") for a in links if "-g.pdf" in a.get("href", "")),
-        links[1].get("href") if len(links) >= 2 else None,
-    )
-    if not href:
-        raise RuntimeError("業種別集計PDFのリンクが見つかりませんでした。")
+    # 日付未指定 → 先頭行（最新）
+    if target_date is None:
+        return next(iter(date_url_map.values()))
 
-    return href if href.startswith("http") else JPX_BASE_URL + href
+    if target_date not in date_url_map:
+        available = ", ".join(date_url_map.keys())
+        raise RuntimeError(
+            f"指定日付 '{target_date}' が一覧に見つかりません。\n"
+            f"取得可能な日付: {available}"
+        )
+
+    return date_url_map[target_date]
 
 
 def download_pdf(url: str) -> bytes:
@@ -224,18 +248,26 @@ def write_date_column(ws: gspread.Worksheet, target_date: str, key: str, data: d
 # ================================================================
 
 def main() -> None:
+    # 日付の優先順位: コマンドライン引数 > 環境変数 TARGET_DATE > None（最新）
+    target_date: Optional[str] = None
+    if len(sys.argv) >= 2:
+        target_date = sys.argv[1]
+    elif os.environ.get("TARGET_DATE"):
+        target_date = os.environ["TARGET_DATE"]
+
     print("=" * 55)
     print("  JPX 空売り業種別集計 取得スクリプト")
+    print(f"  対象日付: {target_date if target_date else '最新（自動）'}")
     print("=" * 55)
 
     # Step 1: PDF URL 取得
-    pdf_url = get_latest_pdf_url()
+    pdf_url = get_pdf_url(target_date)
     print(f"[1/3] PDF URL  : {pdf_url}")
 
     # Step 2: PDF ダウンロード＆パース
     pdf_bytes = download_pdf(pdf_url)
-    target_date, data = parse_pdf(pdf_bytes)
-    print(f"[2/3] 対象日付 : {target_date}  /  取得業種数 : {len(data)}")
+    parsed_date, data = parse_pdf(pdf_bytes)
+    print(f"[2/3] 対象日付 : {parsed_date}  /  取得業種数 : {len(data)}")
 
     # Step 3: スプレッドシート書き込み
     print("[3/3] スプレッドシートに書き込み中...")
@@ -246,7 +278,7 @@ def main() -> None:
         ws = spreadsheet.get_worksheet_by_id(sheet_info["gid"])
         print(f"      シート『{sheet_info['name']}』")
         ensure_industry_column(ws)
-        write_date_column(ws, target_date, key, data)
+        write_date_column(ws, parsed_date, key, data)
 
     print("=" * 55)
     print("  完了しました。")
