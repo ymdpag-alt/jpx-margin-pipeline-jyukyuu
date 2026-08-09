@@ -31,7 +31,7 @@ from google.oauth2.service_account import Credentials
 # ================================================================
 
 # --- JPX サイト ---
-JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/short-selling/00-archives-01.html"
+JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/short-selling/index.html"
 JPX_BASE_URL  = "https://www.jpx.co.jp"
 HTTP_TIMEOUT  = 30  # 秒
 HTTP_HEADERS  = {
