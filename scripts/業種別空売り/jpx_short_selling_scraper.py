@@ -41,10 +41,10 @@ SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
 
 #   PDFカテゴリ(a/b/c/d) → 書き込み先シートGID
 SHEET_MAP = {
-    "a": {"gid": 162001397,  "name": "実注文"},
+    "a": {"gid": 162001397,  "name": "空売り（実注文"},
     "b": {"gid": 692441937,  "name": "空売り（価格規制あり）"},
     "c": {"gid": 1306991615, "name": "空売り（価格規制なし）"},
-    "d": {"gid": 668166970,  "name": "合計"},
+    "d": {"gid": 668166970,  "name": "空売り（合計"},
 }
 
 GOOGLE_SCOPES = [
