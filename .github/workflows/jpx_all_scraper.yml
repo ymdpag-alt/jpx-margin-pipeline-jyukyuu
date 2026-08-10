@@ -36,12 +36,20 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements_jpx_all.txt
+          # cache-dependency-path は省略 (requirements_jpx_all.txt を別途コミット
+          # している場合は  cache: pip  +  cache-dependency-path を追加可)
 
       # ── 3. 依存ライブラリをインストール
+      # requirements_jpx_all.txt をリポジトリにコミットしている場合は
+      #   run: pip install -r requirements_jpx_all.txt
+      # に切り替え可能
       - name: 依存ライブラリ インストール
-        run: pip install -r requirements_jpx_all.txt
+        run: |
+          pip install \
+            "requests>=2.31.0" \
+            "beautifulsoup4>=4.12.0" \
+            "gspread>=6.0.0" \
+            "google-auth>=2.27.0"
 
       # ── 4. スクレイプ実行
       - name: JPX スクレイプ実行
