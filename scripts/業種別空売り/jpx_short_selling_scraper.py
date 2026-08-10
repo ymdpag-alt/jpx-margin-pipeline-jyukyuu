@@ -221,7 +221,10 @@ def ensure_industry_column(ws: gspread.Worksheet) -> None:
 
 
 def write_date_column(ws: gspread.Worksheet, target_date: str, key: str, data: dict) -> None:
-    """C列以降に日付列を追記する。同日付が既に存在する場合は上書き。"""
+    """C列以降に日付列を書き込む。
+    - 同日付が既存 → 上書き（位置はそのまま）
+    - 新規日付     → C列に1列挿入して既存データを右にシフト
+    """
     header_row = ws.row_values(1)
 
     # C列（idx=3）以降から同日付の既存列を探す
@@ -231,12 +234,22 @@ def write_date_column(ws: gspread.Worksheet, target_date: str, key: str, data: d
             target_col = idx
             break
 
-    # 既存列がなければ末尾に追加（最低でもC列=3）
     if target_col is None:
-        target_col = max(len(header_row) + 1, 3)
-
-    if target_col > ws.col_count:
-        ws.resize(cols=target_col + 50)
+        # ── 新規日付: C列（0-based index=2）に1列挿入して右シフト ──
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "insertDimension": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 2,   # 0-based: A=0, B=1, C=2
+                        "endIndex": 3,
+                    },
+                    "inheritFromBefore": False,
+                }
+            }]
+        })
+        target_col = 3  # C列（1-based）
 
     letter = col_letter(target_col)
     ws.update(range_name=f"{letter}1", values=[[target_date]])
