@@ -1,27 +1,32 @@
-name: JPX 日報 株式相場表 取得
+name: JPX 品貸料データ取得
 
 on:
+  # 平日 16:30 JST (UTC 07:30) に自動実行
+  # 品貸料は16:00目安で掲載のため、少し後にスケジュール
   schedule:
-    # 日本時間(JST, UTC+9) 平日20:00に実行
-    # GitHub Actionsのcronは UTC 基準。20:00 JST = 11:00 UTC(同一日内に収まるため曜日のずれなし)
-    # cron の曜日は 0=日,1=月,...,6=土 なので、月〜金 = 1-5
-    - cron: "0 11 * * 1-5"
+    - cron: '30 7 * * 1-5'
+
+  # 手動実行（日付指定可能）
   workflow_dispatch:
     inputs:
       date:
-        description: "取得したい日付 (YYYY-MM-DD)。空欄なら最新日を自動取得。"
+        description: '取得日付 (YYYY-MM-DD、省略時は最新データ)'
         required: false
-        default: ""
-      force:
-        description: "同じ日付列が既にある場合も強制的に再挿入する"
+        default: ''
+      dry_run:
+        description: 'DRY-RUN（書き込みせず確認のみ）'
         required: false
-        default: "false"
-        type: boolean
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
-  fetch-jpx-daily:
+  fetch-hinkatsu:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,23 +34,37 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        working-directory: scripts/daily
-        run: pip install -r "Requirements.txt"
+        run: pip install -r scripts/品貸料/requirements.txt
 
-      - name: JPX日報を取得してスプレッドシートに書き込み
-        working-directory: scripts/daily
+      - name: Run fetch script
         env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}  # 未設定でもOK(スクリプト内デフォルトを使用)
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
         run: |
-          ARGS=""
+          CMD="python scripts/品貸料/fetch_hinkatsu.py"
+
+          # 日付指定（手動実行時のみ）
           if [ -n "${{ github.event.inputs.date }}" ]; then
-            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+            CMD="$CMD --date ${{ github.event.inputs.date }}"
           fi
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            ARGS="$ARGS --force"
+
+          # DRY-RUN オプション
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            CMD="$CMD --dry-run"
           fi
-          python "Fetch jpx daily.py" $ARGS
+
+          echo "実行コマンド: $CMD"
+          $CMD
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::品貸料データの取得に失敗しました。ログを確認してください。"
