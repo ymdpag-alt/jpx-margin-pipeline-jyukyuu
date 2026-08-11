@@ -146,11 +146,13 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 # 3. テキストパース
 # ------------------------------------------------------------------
 
-CODE_NAME_RE = re.compile(r'^(?P<code>[0-9][0-9A-Za-z]{3})\s+(?P<name_jp>\S.+)$')
+CODE_RE_STR = r'[0-9][0-9A-Za-z]{3}'
 
 NUM = r'[\d,]+(?:\.\d+)?'
 DATA_LINE_RE = re.compile(
-    r'^(?P<unit>\d+)\s+'
+    r'^(?P<code>' + CODE_RE_STR + r')\s+'
+    r'(?P<unit>\d+)\s+'
+    r'(?P<name_jp>\S+)\s+'
     r'(?P<am_open>' + NUM + r')\s+'
     r'(?P<am_high>' + NUM + r')\s+'
     r'(?P<am_low>' + NUM + r')\s+'
@@ -169,19 +171,21 @@ DATA_LINE_RE = re.compile(
     r'(?P<value>' + NUM + r')\s*$'
 )
 
+# ページ毎に繰り返される定型ヘッダー/フッター行(実際のPDF出力に合わせたもの)
 HEADER_JUNK_EXACT = {
     "株 式 相 場 表", "Stock Quotations",
     "立 会 市 場 普 通 取 引", "Auction Trades Regular Way",
-    "千円[￥thous.]", "Trading Value", "千株[thous.shs.]",
-    "千口/千個[thous.units.]", "Trading Volume",
-    "円[￥]", "Net Change", "Final special quote",
-    "売買高 売買代金", "Close", "最終気配 前日比 終値",
-    "Low", "安値", "High", "高値", "Open", "始値 銘柄名", "Issues",
-    "売買", "単位", "Trading", "Unit Code", "コード",
     "午前 (The morning trading session) 午後 (The afternoon trading session)",
-    "始値", "高値", "安値", "終値",
-    "円[￥] 円[￥] 円[￥] 円[￥]",
-    "売買高加重", "平均価格", "VWAP", "円[￥]",
+    "売買 売買高加重",
+    "コード 銘柄名 最終気配 前日比 売買高 売買代金",
+    "単位 始値 高値 安値 終値 始値 高値 安値 終値 平均価格",
+    "Trading",
+    "Code Issues Open High Low Close Open High Low Close Final special quote "
+    "Net Change VWAP Trading Volume Trading Value",
+    "Unit",
+    "円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] "
+    "千株[thous.shs.] 千円[￥thous.]",
+    "千口/千個[thous.units.]",
 }
 DATE_PAGE_RE = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日')
 COPYRIGHT_RE = re.compile(r'^Copyright \(c\) Tokyo Stock Exchange')
@@ -212,48 +216,38 @@ def is_junk(line: str) -> bool:
 def parse_text(text: str) -> list[dict]:
     """
     PDFから抽出したテキストを解析し、銘柄ごとのレコード(dict)のリストを返す。
-    各レコードには code/name_jp/name_en に加え、直前に出現したセクション見出しから
-    推定した industry(業種) / market(市場) を付与する。
+
+    実際のPDFのレイアウトは、1銘柄につき以下の2行で構成される:
+        1行目: コード 売買単位 銘柄名(和文) 前場OHLC 後場OHLC 最終気配 前日比 VWAP 出来高 売買代金
+        2行目: 銘柄名(英文)
+
+    その手前に出現する「業種」「市場」見出し行を状態として保持し、各レコードに付与する。
     """
     lines = text.splitlines()
     content = [l for l in lines if not is_junk(l)]
 
     current_market = None
     current_industry = None
-    pending_code = None
-    pending_name_jp = None
-    pending_name_en = None
+    pending_record = None  # データ行はマッチしたが、まだ英文社名行を待っている状態
 
     records = []
-    skipped_data_lines = 0
 
     for raw in content:
         s = raw.strip()
 
+        if pending_record is not None:
+            # 直前のデータ行の次に来る行は英文社名(そのまま採用)
+            pending_record["name_en"] = s
+            records.append(pending_record)
+            pending_record = None
+            continue
+
         dm = DATA_LINE_RE.match(s)
         if dm:
-            if pending_code is not None and pending_name_en is not None:
-                rec = dm.groupdict()
-                rec["code"] = pending_code
-                rec["name_jp"] = pending_name_jp
-                rec["name_en"] = pending_name_en
-                rec["industry"] = current_industry
-                rec["market"] = current_market
-                records.append(rec)
-            else:
-                skipped_data_lines += 1
-            pending_code = pending_name_jp = pending_name_en = None
-            continue
-
-        cm = CODE_NAME_RE.match(s)
-        if cm and pending_code is None:
-            pending_code = cm.group("code")
-            pending_name_jp = cm.group("name_jp")
-            continue
-
-        if pending_code is not None and pending_name_en is None:
-            # コード行の直後に来る英語銘柄名の行
-            pending_name_en = s
+            rec = dm.groupdict()
+            rec["industry"] = current_industry
+            rec["market"] = current_market
+            pending_record = rec
             continue
 
         # ここに来るのは「業種見出し」または「市場見出し」等のセクション行
@@ -264,9 +258,11 @@ def parse_text(text: str) -> list[dict]:
         else:
             current_industry = s
 
-    if skipped_data_lines:
-        print(f"[WARN] コード名を特定できず読み飛ばしたデータ行: {skipped_data_lines}件"
-              " (会社名が複数行に折り返された等の理由が考えられます)", file=sys.stderr)
+    if pending_record is not None:
+        # 最終行がデータ行で終わっていて英文社名行が取得できなかった場合
+        pending_record["name_en"] = ""
+        records.append(pending_record)
+
     return records
 
 
@@ -440,7 +436,7 @@ def _dump_debug_info(text: str):
     for l in non_empty[:60]:
         print(f"    {l!r}", file=sys.stderr)
     # コードらしき行(4桁の英数字+空白+日本語)がそもそも存在するか確認
-    code_like = [l for l in non_empty if CODE_NAME_RE.match(l.strip())][:10]
+    code_like = [l for l in non_empty if re.match(r'^' + CODE_RE_STR + r'\s', l.strip())][:10]
     print(f"[DEBUG] コード行らしきもの: {len(code_like)}件(先頭10件)", file=sys.stderr)
     for l in code_like:
         print(f"    {l!r}", file=sys.stderr)
