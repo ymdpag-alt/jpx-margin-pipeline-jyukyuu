@@ -37,6 +37,25 @@ SECTOR_LABELS = {"current": "現在値", "low": "安値", "high": "高値", "ope
 SECTOR_MARKER = "A35"
 SECTOR_COL    = {"name": 0, "current": 1, "open": 3, "high": 4, "low": 5}
 
+# 東証33業種（TOPIX-17ではなく、東証業種別株価指数33業種）
+SECTOR33 = [
+    "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙",
+    "化学", "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品",
+    "鉄鋼", "非鉄金属", "金属製品", "機械", "電気機器", "輸送用機器",
+    "精密機器", "その他製品", "電気・ガス業", "陸運業", "海運業", "空運業",
+    "倉庫・運輸関連業", "情報・通信業", "卸売業", "小売業", "銀行業",
+    "証券・商品先物取引業", "保険業", "その他金融業", "不動産業", "サービス業",
+]
+
+def _norm(s: str) -> str:
+    """比較用に正規化: 空白・中黒・全角/半角の揺れを吸収"""
+    s = s.replace("\u3000", "").replace(" ", "").replace("　", "")
+    s = s.replace("・", "").replace("･", "")
+    s = s.replace("（", "(").replace("）", ")")
+    return s.strip()
+
+SECTOR33_NORM = {_norm(x): x for x in SECTOR33}
+
 SKIP_NAMES = frozenset([
     "指数名", "銘柄", "業種", "指数", "現在値", "前日比", "始値", "高値", "安値",
     "前日終値", "騰落率", "リアルタイムグラフ", "ヒストリカルグラフ",
@@ -126,33 +145,75 @@ def fetch(url):
 #  ページ構造: 公表日(0) | 取引内容リンク(1)
 #  出力列:    公表日 | 取引日 | コード | 銘柄 | 価格 | 売買高 | 売買代金
 # ═════════════════════════════════════════════════════════════
-def _parse_tostnet_detail(soup, kouhyo_date):
-    """詳細ページから取引行を抽出"""
+def _parse_tostnet_xlsx(url, kouhyo_date):
+    """
+    ToSTNeT 超大口約定情報の xlsx をダウンロードしてパース。
+    出力: [[公表日, 取引日, コード, 銘柄, 価格, 売買高, 売買代金], ...]
+    """
+    import io
+    import openpyxl
+
+    resp = requests.get(url, headers=HTTP_HEADERS, timeout=60)
+    resp.raise_for_status()
+
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content), data_only=True)
+    out = []
+
+    for ws in wb.worksheets:
+        log.info("  [xlsx] シート '%s' (%d行 x %d列)",
+                 ws.title, ws.max_row, ws.max_column)
+
+        for row in ws.iter_rows(values_only=True):
+            cells = ["" if c is None else str(c).strip() for c in row]
+            if not any(cells):
+                continue
+
+            # 4桁コードを含む列を探す
+            code_idx = None
+            for i, c in enumerate(cells):
+                # 数値セルは '1234' or '1234.0' の形になり得る
+                c2 = c.split(".")[0] if "." in c else c
+                if re.fullmatch(r"\d{4}", c2):
+                    code_idx = i
+                    break
+
+            if code_idx is None:
+                continue
+
+            code = cells[code_idx].split(".")[0]
+            # コード列の前=取引日、後ろ=銘柄/価格/売買高/売買代金 と想定
+            torihiki = cells[code_idx - 1] if code_idx >= 1 else ""
+            rest = cells[code_idx + 1: code_idx + 5]
+            rest += [""] * (4 - len(rest))
+
+            out.append([kouhyo_date, torihiki, code,
+                        rest[0], rest[1], rest[2], rest[3]])
+
+    if not out:
+        # デバッグ: xlsx の先頭数行を出力
+        ws = wb.worksheets[0]
+        log.info("  [DEBUG xlsx] 先頭6行:")
+        for j, row in enumerate(ws.iter_rows(max_row=6, values_only=True)):
+            log.info("    row[%d]: %s", j,
+                     [str(c)[:20] if c is not None else "" for c in row])
+
+    return out
+
+
+def _parse_tostnet_html(soup, kouhyo_date):
+    """リンク先が HTML の場合のフォールバックパーサ"""
     out = []
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             cells = [td.get_text(strip=True) for td in tr.find_all("td")]
             if not cells:
                 continue
-            # 4桁コードが含まれる行を探す
             for idx, c in enumerate(cells):
                 if re.fullmatch(r"\d{4}", c) and idx >= 1:
                     row = [kouhyo_date] + cells[max(0, idx-1): idx+6]
                     if len(row) >= 7:
                         out.append(row[:7])
                     break
-            # 先頭が日付の場合
-            if not out and len(cells) >= 6 and DATE_PAT.match(cells[0]):
-                out.append([kouhyo_date] + cells[:6])
-
-    if not out:
-        tables = soup.find_all("table")
-        log.info("  [DEBUG 詳細ページ] テーブル数=%d", len(tables))
-        for i, tbl in enumerate(tables[:3]):
-            for j, tr in enumerate(tbl.find_all("tr")[:3]):
-                cells = [c.get_text(strip=True) for c in tr.find_all(["th","td"])]
-                log.info("    table[%d] row[%d] %d列: %s",
-                         i, j, len(cells), [c[:20] for c in cells])
     return out
 
 
@@ -191,12 +252,16 @@ def scrape_tostnet(target_date=None):
 
             log.info("  ToSTNeT: %s → %s", kouhyo, href)
             try:
-                detail_soup = fetch(href)
-                rows = _parse_tostnet_detail(detail_soup, kouhyo)
+                if href.lower().endswith((".xlsx", ".xls")):
+                    rows = _parse_tostnet_xlsx(href, kouhyo)
+                    log.info("  xlsx: %d 件取得", len(rows))
+                else:
+                    detail_soup = fetch(href)
+                    rows = _parse_tostnet_html(detail_soup, kouhyo)
+                    log.info("  HTML: %d 件取得", len(rows))
                 out.extend(rows)
-                log.info("  詳細ページ: %d 件取得", len(rows))
             except Exception as e:
-                log.warning("  詳細ページ取得失敗: %s", e)
+                log.warning("  取得失敗: %s", e, exc_info=True)
 
             if not target_date:
                 break   # 最新日のみ
@@ -305,16 +370,26 @@ def _parse_sector_html(soup):
                 continue
             if not re.search(r"[\d０-９,，.]", cur):
                 continue
-            if name in seen:
+            # ── 33業種ホワイトリストで絞り込み ──
+            key = _norm(name)
+            if key not in SECTOR33_NORM:
                 continue
-            seen.add(name)
+            canonical = SECTOR33_NORM[key]   # 正式名称に統一
+
+            if canonical in seen:
+                continue
+            seen.add(canonical)
             out.append({
-                "name":    name,
+                "name":    canonical,
                 "current": cur,
                 "high":    cells[SECTOR_COL["high"]],
                 "low":     cells[SECTOR_COL["low"]],
                 "open":    cells[SECTOR_COL["open"]],
             })
+
+    # SECTOR33 の定義順にソート（毎回同じ行順を保証）
+    order = {n: i for i, n in enumerate(SECTOR33)}
+    out.sort(key=lambda d: order.get(d["name"], 999))
     return out
 
 
@@ -370,10 +445,12 @@ def write_sector_block(ws, data, metric, start_row):
     n = len(data)
     if n == 0:
         return
-    ws.update(f"A{start_row}:A{start_row+n-1}",
-              [[d["name"]] for d in data], value_input_option="USER_ENTERED")
-    ws.update(f"C{start_row}:C{start_row+n-1}",
-              [[d[metric]] for d in data], value_input_option="USER_ENTERED")
+    ws.update(values=[[d["name"]] for d in data],
+              range_name=f"A{start_row}:A{start_row+n-1}",
+              value_input_option="USER_ENTERED")
+    ws.update(values=[[d[metric]] for d in data],
+              range_name=f"C{start_row}:C{start_row+n-1}",
+              value_input_option="USER_ENTERED")
     log.info("    ✓ %s: row%d〜%d (%d件)",
              SECTOR_LABELS[metric], start_row, start_row+n-1, n)
     time.sleep(1.2)
@@ -396,7 +473,8 @@ def run_sector(ss):
     time.sleep(1.5)
     for metric, start_row in SECTOR_ROWS.items():
         write_sector_block(ws, data, metric, start_row)
-    ws.update(SECTOR_MARKER, [[today]], value_input_option="USER_ENTERED")
+    ws.update(values=[[today]], range_name=SECTOR_MARKER,
+              value_input_option="USER_ENTERED")
     log.info("  ✓ マーカー更新: %s ← %s", SECTOR_MARKER, today)
 
 
