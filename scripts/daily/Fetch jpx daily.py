@@ -94,14 +94,52 @@ def download_pdf(url: str) -> bytes:
     return resp.content
 
 
+def _normalize_numeric_spacing(line: str) -> str:
+    """
+    単語抽出時に、数値の小数点やカンマの前後で不自然にスペースが入ってしまうことがあるため、
+    "4,465 .00" -> "4,465.00" のように数値表記を正規化する。
+    """
+    line = re.sub(r'(\d)\s+\.(\d)', r'\1.\2', line)   # "123 .45" -> "123.45"
+    line = re.sub(r'(\d)\s*,\s+(\d{3})', r'\1,\2', line)  # "4 ,465" -> "4,465"
+    line = re.sub(r'-\s+(\d)', r'-\1', line)          # "- 51.00" -> "-51.00"
+    return line
+
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """
+    PDFからテキストを抽出する。
+
+    pdfplumber の素朴な extract_text() は、密な表組みのPDFで隣接する列同士の間の
+    空白を正しく再現できず、数値が連結されてしまう(例: "4,465.004,490.00")ことがある。
+    そのため、単語(word)単位で座標(top/x0)を取得し、Y座標が近い単語をまとめて1行とし、
+    X座標順に並べて明示的に半角スペースで結合する方式で行を再構成する。
+    """
     import pdfplumber
-    text_parts = []
+
+    lines = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            t = page.extract_text() or ""
-            text_parts.append(t)
-    return "\n".join(text_parts)
+            words = page.extract_words(x_tolerance=1, y_tolerance=3, keep_blank_chars=False)
+            if not words:
+                continue
+            words.sort(key=lambda w: (w["top"], w["x0"]))
+
+            current_line = []
+            current_top = None
+            for w in words:
+                if current_top is None or abs(w["top"] - current_top) <= 3:
+                    current_line.append(w)
+                    current_top = w["top"] if current_top is None else (current_top + w["top"]) / 2
+                else:
+                    current_line.sort(key=lambda x: x["x0"])
+                    lines.append(_normalize_numeric_spacing(" ".join(x["text"] for x in current_line)))
+                    current_line = [w]
+                    current_top = w["top"]
+            if current_line:
+                current_line.sort(key=lambda x: x["x0"])
+                lines.append(_normalize_numeric_spacing(" ".join(x["text"] for x in current_line)))
+
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------
@@ -121,7 +159,10 @@ DATA_LINE_RE = re.compile(
     r'(?P<pm_high>' + NUM + r')\s+'
     r'(?P<pm_low>' + NUM + r')\s+'
     r'(?P<pm_close>' + NUM + r')\s+'
-    r'(?P<final_quote>[－ー―]|' + NUM + r')\s+'
+    # 「最終気配」が"－"(特殊気配なし)の場合、文字幅が非常に狭いため
+    # 直後の「前日比」の数値とスペース無しで連結されてしまうことがある(例: "－30.00")。
+    # そのためこの境界だけ空白ゼロ許容(\s*)にする。
+    r'(?P<final_quote>[－ー―]|' + NUM + r')\s*'
     r'(?P<net_change>-?' + NUM + r')\s+'
     r'(?P<vwap>' + NUM + r')\s+'
     r'(?P<volume>' + NUM + r')\s+'
@@ -390,6 +431,26 @@ def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = Fals
     mark_processed(sh, date_str, len(records))
 
 
+def _dump_debug_info(text: str):
+    """解析失敗時に、実際に抽出されたテキストの様子をログに出して原因調査を助ける。"""
+    lines = text.splitlines()
+    non_empty = [l for l in lines if l.strip()]
+    print(f"[DEBUG] 抽出テキスト: 総行数={len(lines)}, 非空行数={len(non_empty)}", file=sys.stderr)
+    print("[DEBUG] 先頭60行:", file=sys.stderr)
+    for l in non_empty[:60]:
+        print(f"    {l!r}", file=sys.stderr)
+    # コードらしき行(4桁の英数字+空白+日本語)がそもそも存在するか確認
+    code_like = [l for l in non_empty if CODE_NAME_RE.match(l.strip())][:10]
+    print(f"[DEBUG] コード行らしきもの: {len(code_like)}件(先頭10件)", file=sys.stderr)
+    for l in code_like:
+        print(f"    {l!r}", file=sys.stderr)
+    # 数値が並んでいそうな行(データ行候補)を探す
+    numeric_like = [l for l in non_empty if len(re.findall(r'[\d,]+\.\d+', l)) >= 4][:10]
+    print(f"[DEBUG] 数値が4つ以上並ぶ行(データ行候補): {len(numeric_like)}件(先頭10件)", file=sys.stderr)
+    for l in numeric_like:
+        print(f"    {l!r}", file=sys.stderr)
+
+
 # ------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------
@@ -425,6 +486,7 @@ def main():
 
     if not records:
         print("[ERROR] 1件も解析できませんでした。PDFフォーマットが変更された可能性があります。", file=sys.stderr)
+        _dump_debug_info(text)
         sys.exit(1)
 
     print("[STEP5] Google スプレッドシートへ書き込み中...")
