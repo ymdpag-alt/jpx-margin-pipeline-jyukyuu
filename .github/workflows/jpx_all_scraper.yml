@@ -19,21 +19,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── デバッグ: リポジトリの実際のファイル構造を確認 ──
-      - name: ファイル構造確認
-        run: |
-          echo "=== カレントディレクトリ ==="
-          pwd
-          echo ""
-          echo "=== ルート直下の一覧 ==="
-          ls -la
-          echo ""
-          echo "=== .py ファイルを全検索 ==="
-          find . -name "*.py" | sort
-          echo ""
-          echo "=== フォルダ一覧 ==="
-          find . -type d | sort
-
       - name: Python セットアップ
         uses: actions/setup-python@v5
         with:
@@ -47,11 +32,19 @@ jobs:
             "gspread>=6.0.0" \
             "google-auth>=2.27.0"
 
+      - name: シークレット確認
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          if [ -z "$GOOGLE_CREDENTIALS_JSON" ]; then
+            echo "::error::GOOGLE_CREDENTIALS_JSON が未設定です"
+            echo "Settings → Secrets and variables → Actions でシークレットを追加してください"
+            exit 1
+          fi
+          echo "✓ GOOGLE_CREDENTIALS_JSON が設定されています (${#GOOGLE_CREDENTIALS_JSON} 文字)"
+
       - name: JPX スクレイプ実行
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           TZ: Asia/Tokyo
-        run: |
-          SCRIPT=$(find . -name "scrape_jpx_all.py" | head -1)
-          echo "スクリプトパス: $SCRIPT"
-          python "$SCRIPT"
+        run: python scripts/JPX/scrape_jpx_all.py
