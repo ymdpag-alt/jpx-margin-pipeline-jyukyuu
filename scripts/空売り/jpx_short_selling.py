@@ -13,17 +13,24 @@ JPX「空売りの残高に関する情報」を取得し、Google スプレッ�
     既存のコードは同じ行に書き込み、新規コードは最終行に追加する。
     データが無い銘柄のセルは空白のまま。
 
+コマンドライン引数（他スクリプトと同じ呼び出し方式。省略時は環境変数を使用）:
+    --date YYYY-MM-DD   取得する公表日（省略時は最新）
+    --force             既にその日付の列がある場合でも上書きする
+    --dry-run           書き込みせず内容だけ表示する
+
 環境変数:
-    GCP_SERVICE_ACCOUNT_JSON  必須  サービスアカウントJSON（文字列そのもの）
-    SPREADSHEET_ID            必須  スプレッドシートID
-    TARGET_DATE               任意  YYYY-MM-DD / YYYYMMDD。未指定なら最新の公表日
-    RATIO_AS_PERCENT          任意  1(既定)=割合を%表記(0.0051→0.51) / 0=生値のまま
-    MAX_DATE_COLS             任意  保持する日付列の最大数（既定 300、0で無制限）
-    DRY_RUN                   任意  1 なら書き込みせず内容だけ表示
+    GOOGLE_SERVICE_ACCOUNT_JSON  必須  サービスアカウントJSON（文字列そのもの）
+                                        ※旧名 GCP_SERVICE_ACCOUNT_JSON も後方互換で使用可
+    SPREADSHEET_ID               任意  未設定時はスクリプト内デフォルトを使用
+    TARGET_DATE                  任意  --date 未指定時のフォールバック
+    RATIO_AS_PERCENT             任意  1(既定)=割合を%表記(0.0051→0.51) / 0=生値のまま
+    MAX_DATE_COLS                任意  保持する日付列の最大数（既定 300、0で無制限）
+    DRY_RUN                      任意  --dry-run 未指定時のフォールバック
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import io
 import json
@@ -47,6 +54,9 @@ from google.oauth2.service_account import Credentials
 JST = dt.timezone(dt.timedelta(hours=9))
 ORIGIN = "https://www.jpx.co.jp"
 INDEX_URL = f"{ORIGIN}/markets/public/short-selling/index.html"
+
+# SPREADSHEET_ID 環境変数が未設定の場合に使うデフォルト
+DEFAULT_SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
 
 REQ_HEADERS = {
     "User-Agent": (
@@ -379,9 +389,15 @@ def format_value(metric: str, value: Any, ratio_as_percent: bool) -> Any:
 # Google スプレッドシート書き込み
 # --------------------------------------------------------------------------
 def open_spreadsheet(spreadsheet_id: str) -> gspread.Spreadsheet:
-    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    raw = (
+        os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        or os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()  # 後方互換
+    )
     if not raw:
-        raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON が設定されていません。")
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON が設定されていません "
+            "(Secrets に GOOGLE_SERVICE_ACCOUNT_JSON を登録してください)。"
+        )
     info = json.loads(raw)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds).open_by_key(spreadsheet_id)
@@ -396,6 +412,7 @@ def write_metric_sheet(
     ratio_as_percent: bool,
     max_date_cols: int,
     dry_run: bool,
+    force: bool,
 ) -> None:
     ws = ss.get_worksheet_by_id(gid)
     date_label = pub_date.strftime("%Y/%m/%d")
@@ -453,8 +470,11 @@ def write_metric_sheet(
                 }
             )
         target_col = 3
+    elif not force:
+        log(f"  {date_label} は既に {col_letter(target_col)}列に存在 → スキップ（上書きするには --force / FORCE=1）")
+        return
     else:
-        log(f"  {date_label} は既に {col_letter(target_col)}列に存在 → 上書き")
+        log(f"  {date_label} は既に {col_letter(target_col)}列に存在 → --force により上書き")
 
     # ---- 新規銘柄を最終行へ追加 ------------------------------------------
     known = set(existing_codes)
@@ -518,18 +538,31 @@ def _ensure_size(ws: gspread.Worksheet, rows: int, cols: int) -> None:
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
-def main() -> int:
-    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
-    if not spreadsheet_id:
-        raise RuntimeError("SPREADSHEET_ID が設定されていません。")
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="JPX 空売り残高をスプレッドシートへ取り込む")
+    p.add_argument("--date", dest="date", default=None, help="取得する公表日 (YYYY-MM-DD)。省略時は最新")
+    p.add_argument("--force", dest="force", action="store_true", default=None, help="既存の日付列があっても上書きする")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", default=None, help="書き込まずに内容だけ表示する")
+    return p.parse_args()
 
-    target_date = os.environ.get("TARGET_DATE", "").strip() or None
+
+def main() -> int:
+    args = parse_args()
+
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip() or DEFAULT_SPREADSHEET_ID
+
+    target_date = args.date or os.environ.get("TARGET_DATE", "").strip() or None
     ratio_as_percent = os.environ.get("RATIO_AS_PERCENT", "1") not in ("0", "false", "False")
     max_date_cols = int(os.environ.get("MAX_DATE_COLS", "300") or 0)
-    dry_run = os.environ.get("DRY_RUN", "0") in ("1", "true", "True")
+
+    dry_run = args.dry_run if args.dry_run is not None else os.environ.get("DRY_RUN", "0") in ("1", "true", "True")
+    force = args.force if args.force is not None else os.environ.get("FORCE", "0") in ("1", "true", "True")
 
     log("=== JPX 空売り残高 取り込み開始 ===")
-    log(f"TARGET_DATE={target_date or '(最新)'} / RATIO_AS_PERCENT={ratio_as_percent} / DRY_RUN={dry_run}")
+    log(
+        f"TARGET_DATE={target_date or '(最新)'} / RATIO_AS_PERCENT={ratio_as_percent} "
+        f"/ DRY_RUN={dry_run} / FORCE={force}"
+    )
 
     index = fetch_file_index()
     pub_date, url = resolve_target(index, target_date)
@@ -547,7 +580,7 @@ def main() -> int:
     for metric, gid in SHEET_GIDS.items():
         try:
             write_metric_sheet(
-                ss, metric, gid, pub_date, records, ratio_as_percent, max_date_cols, dry_run
+                ss, metric, gid, pub_date, records, ratio_as_percent, max_date_cols, dry_run, force
             )
         except Exception as e:  # noqa: BLE001
             log(f"!!! [{metric}] でエラー: {e}")
