@@ -1,0 +1,65 @@
+name: JPX 品貸料データ取得
+
+on:
+  # 平日 16:30 JST (UTC 07:30) に自動実行
+  # 品貸料は16:00目安で掲載のため、少し後にスケジュール
+  schedule:
+    - cron: '30 7 * * 1-5'
+
+  # 手動実行（日付指定可能）
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '取得日付 (YYYY-MM-DD、省略時は最新データ)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'DRY-RUN（書き込みせず確認のみ）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  fetch-hinkatsu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run fetch script
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          CMD="python scripts/fetch_hinkatsu.py"
+
+          # 日付指定（手動実行時のみ）
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            CMD="$CMD --date ${{ github.event.inputs.date }}"
+          fi
+
+          # DRY-RUN オプション
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          echo "実行コマンド: $CMD"
+          $CMD
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::品貸料データの取得に失敗しました。ログを確認してください。"
