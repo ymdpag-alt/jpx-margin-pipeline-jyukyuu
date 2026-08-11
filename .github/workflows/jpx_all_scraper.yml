@@ -1,21 +1,10 @@
 name: JPX 一括スクレイプ
 
-# ─────────────────────────────────────────────────────────────
-# トリガー設定
-#   schedule : 平日 16:00 JST (07:00 UTC) に自動実行 — 大引け後約 30 分
-#   workflow_dispatch : GitHub UI から手動実行も可能
-# ─────────────────────────────────────────────────────────────
 on:
   schedule:
-    - cron: "0 7 * * 1-5"
+    - cron: "0 7 * * 1-5"   # 平日 16:00 JST (07:00 UTC)
   workflow_dispatch:
-    inputs:
-      debug:
-        description: "デバッグログを有効化 (true/false)"
-        required: false
-        default: "false"
 
-# 同一ジョブの多重実行を防止
 concurrency:
   group: jpx-scrape
   cancel-in-progress: false
@@ -27,22 +16,14 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # ── 1. リポジトリを取得
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Python 環境を準備
-      - name: Python セットアップ (3.11)
+      - name: Python セットアップ
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # cache-dependency-path は省略 (requirements_jpx_all.txt を別途コミット
-          # している場合は  cache: pip  +  cache-dependency-path を追加可)
 
-      # ── 3. 依存ライブラリをインストール
-      # requirements_jpx_all.txt をリポジトリにコミットしている場合は
-      #   run: pip install -r requirements_jpx_all.txt
-      # に切り替え可能
       - name: 依存ライブラリ インストール
         run: |
           pip install \
@@ -51,14 +32,8 @@ jobs:
             "gspread>=6.0.0" \
             "google-auth>=2.27.0"
 
-      # ── 4. スクレイプ実行
       - name: JPX スクレイプ実行
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           TZ: Asia/Tokyo
-        run: python scrape_jpx_all.py
-
-      # ── 5. 失敗時に Slack 等へ通知する場合はここに追加
-      # - name: 失敗通知
-      #   if: failure()
-      #   uses: ...
+        run: python "スクリプト/JPX/scrape_jpx_all.py"
