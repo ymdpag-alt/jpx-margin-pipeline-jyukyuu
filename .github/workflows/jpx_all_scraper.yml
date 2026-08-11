@@ -19,6 +19,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── デバッグ: リポジトリの実際のファイル構造を確認 ──
+      - name: ファイル構造確認
+        run: |
+          echo "=== カレントディレクトリ ==="
+          pwd
+          echo ""
+          echo "=== ルート直下の一覧 ==="
+          ls -la
+          echo ""
+          echo "=== .py ファイルを全検索 ==="
+          find . -name "*.py" | sort
+          echo ""
+          echo "=== フォルダ一覧 ==="
+          find . -type d | sort
+
       - name: Python セットアップ
         uses: actions/setup-python@v5
         with:
@@ -36,4 +51,7 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           TZ: Asia/Tokyo
-        run: python "スクリプト/JPX/scrape_jpx_all.py"
+        run: |
+          SCRIPT=$(find . -name "scrape_jpx_all.py" | head -1)
+          echo "スクリプトパス: $SCRIPT"
+          python "$SCRIPT"
