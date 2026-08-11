@@ -54,114 +54,74 @@ REQUEST_HEADERS = {
 # ============================================================
 # Google Sheets 認証
 # ============================================================
-def _looks_like_service_account(text: str):
-    """
-    文字列がサービスアカウント JSON なら dict を返す。違えば None。
-    """
-    if not text or not isinstance(text, str):
-        return None
-    s = text.strip()
-    if not s.startswith("{"):
-        return None
-    try:
-        info = json.loads(s)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(info, dict):
-        return None
-    # サービスアカウントJSONの必須キー
-    if info.get("type") == "service_account" and "private_key" in info and "client_email" in info:
-        return info
-    return None
-
-
 def get_gspread_client():
     """
     サービスアカウント認証情報を取得する。
-    優先順位:
-      1. よく使う環境変数名を直接チェック
-      2. ALL_SECRETS（toJSON(secrets)）内の全Secretを走査
-      3. 全環境変数を走査
-      4. ローカルの credentials.json
+      1. 環境変数 GOOGLE_CREDENTIALS_JSON（GitHub Actions 用）
+      2. ローカルの credentials.json（ローカル実行用）
     """
     creds_info = None
     source = None
 
-    # ── 1. よく使う環境変数名を直接チェック ────────────
-    env_candidates = [
-        "GOOGLE_CREDENTIALS_JSON",
-        "GCP_SA_KEY",
-        "GOOGLE_SERVICE_ACCOUNT_JSON",
-        "GSPREAD_CREDENTIALS",
-        "GOOGLE_SERVICE_ACCOUNT_KEY",
-        "SERVICE_ACCOUNT_JSON",
-        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
-        "GDRIVE_CREDENTIALS",
-        "SHEETS_CREDENTIALS",
-    ]
-    for var_name in env_candidates:
-        info = _looks_like_service_account(os.environ.get(var_name, ""))
-        if info:
-            creds_info = info
-            source = f"環境変数 '{var_name}'"
-            break
+    # ── 1. 環境変数 ────────────────────────────────────
+    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if raw:
+        try:
+            creds_info = json.loads(raw)
+            source = "環境変数 GOOGLE_CREDENTIALS_JSON"
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"GOOGLE_CREDENTIALS_JSON の JSON 解析に失敗しました: {e}\n"
+                "  Secret にはサービスアカウント JSON ファイルの中身を\n"
+                "  丸ごと（{ から } まで）ペーストしてください。"
+            ) from e
 
-    # ── 2. ALL_SECRETS（toJSON(secrets)）を走査 ────────
-    if creds_info is None:
-        all_secrets_raw = os.environ.get("ALL_SECRETS", "")
-        if all_secrets_raw:
-            try:
-                all_secrets = json.loads(all_secrets_raw)
-                print(f"    リポジトリのSecret一覧: {sorted(all_secrets.keys())}")
-                for key, value in all_secrets.items():
-                    info = _looks_like_service_account(value)
-                    if info:
-                        creds_info = info
-                        source = f"Secret '{key}'（自動検出）"
-                        break
-            except (json.JSONDecodeError, ValueError) as e:
-                print(f"    ⚠️  ALL_SECRETS の解析に失敗: {e}")
-
-    # ── 3. 全環境変数を走査 ────────────────────────────
-    if creds_info is None:
-        for key, value in os.environ.items():
-            info = _looks_like_service_account(value)
-            if info:
-                creds_info = info
-                source = f"環境変数 '{key}'（自動検出）"
-                break
-
-    # ── 4. ローカルの credentials.json ─────────────────
+    # ── 2. ローカルファイル ────────────────────────────
     if creds_info is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        for candidate_path in [
+        for candidate in [
             os.path.join(script_dir, "credentials.json"),
             os.path.join(script_dir, "..", "credentials.json"),
             os.path.join(script_dir, "..", "..", "credentials.json"),
             "credentials.json",
         ]:
-            if os.path.exists(candidate_path):
-                with open(candidate_path) as f:
+            if os.path.exists(candidate):
+                with open(candidate) as f:
                     creds_info = json.load(f)
-                source = f"ファイル '{candidate_path}'"
+                source = f"ファイル {candidate}"
                 break
 
-    # ── 見つからなかった場合 ──────────────────────────
+    # ── 見つからない場合 ───────────────────────────────
     if creds_info is None:
         raise RuntimeError(
             "サービスアカウント認証情報が見つかりませんでした。\n"
-            "  対処方法:\n"
-            "  1. GitHub リポジトリの Settings → Secrets and variables → Actions を開く\n"
-            "  2. サービスアカウントの JSON キーを 'GOOGLE_CREDENTIALS_JSON' という名前で登録する\n"
-            "     （JSON ファイルの中身を丸ごとペースト）\n"
-            "  3. 対象スプレッドシートをサービスアカウントのメールアドレスに\n"
-            "     『編集者』として共有する\n"
-            "  ※ ワークフローの env: に ALL_SECRETS: ${{ toJSON(secrets) }} が\n"
-            "     設定されていれば、Secret名は自動検出されます。"
+            "\n"
+            "  【GitHub Actions で実行する場合】\n"
+            "   1. Settings → Secrets and variables → Actions を開く\n"
+            "   2. New repository secret をクリック\n"
+            "   3. Name に  GOOGLE_CREDENTIALS_JSON  と入力\n"
+            "   4. Secret にサービスアカウント JSON の中身を丸ごとペースト\n"
+            "   5. 対象スプレッドシートを、その JSON 内の client_email に\n"
+            "      『編集者』として共有する\n"
+            "\n"
+            "  ※ 既存のワークフローで別名の Secret を使っている場合は、\n"
+            "     このワークフローの env: を実際の名前に書き換えてください。\n"
+            "     例）GOOGLE_CREDENTIALS_JSON: ${{ secrets.実際の名前 }}\n"
+            "\n"
+            "  【ローカルで実行する場合】\n"
+            "   credentials.json をスクリプトと同じ階層に配置してください。\n"
         )
 
-    print(f"    認証情報: {source} を使用")
-    print(f"    サービスアカウント: {creds_info.get('client_email', '(不明)')}")
+    # ── 中身の妥当性チェック ───────────────────────────
+    missing = [k for k in ("type", "private_key", "client_email") if k not in creds_info]
+    if missing:
+        raise RuntimeError(
+            f"認証情報に必須項目がありません: {missing}\n"
+            "  サービスアカウントの JSON キーであることを確認してください。"
+        )
+
+    print(f"    認証情報: {source}")
+    print(f"    サービスアカウント: {creds_info['client_email']}")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
