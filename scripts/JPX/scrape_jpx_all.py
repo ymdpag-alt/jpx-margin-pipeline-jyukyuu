@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-JPX 一括スクレイパー  v1.4
+JPX 一括スクレイパー  v1.6
   1. ToSTNeT 超大口約定情報       → GID 1044963009
   2. 自己株式立会外買付取引情報   → GID 2116229549
   3. 業種別 33 業種指数           → GID 742855575  ※Playwright 使用
 
 TARGET_DATE 環境変数 (YYYYMMDD):
-  - 指定あり → その日付のデータを取得
+  - 指定あり → その日付「以降」（未来日含む）のデータを取得
   - 指定なし → ページ上の最新日を自動取得
 """
 
+import io
 import json
 import logging
 import os
@@ -35,9 +36,12 @@ JPX_BASE       = "https://www.jpx.co.jp"
 SECTOR_ROWS   = {"current": 1, "low": 40, "high": 80, "open": 120}
 SECTOR_LABELS = {"current": "現在値", "low": "安値", "high": "高値", "open": "始値"}
 SECTOR_MARKER = "A35"
-SECTOR_COL    = {"name": 0, "current": 1, "open": 3, "high": 4, "low": 5}
 
-# 東証33業種（TOPIX-17ではなく、東証業種別株価指数33業種）
+# 業種別指数ページの実測列順（Playwright レンダリング後）:
+#   0=指数名 1=現在値 2=前日比(値) 3=前日比(%) 4=始値 5=高値 6=安値
+SECTOR_COL = {"name": 0, "current": 1, "open": 4, "high": 5, "low": 6}
+
+# 東証33業種
 SECTOR33 = [
     "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙",
     "化学", "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品",
@@ -48,7 +52,6 @@ SECTOR33 = [
 ]
 
 def _norm(s: str) -> str:
-    """比較用に正規化: 空白・中黒・全角/半角の揺れを吸収"""
     s = s.replace("\u3000", "").replace(" ", "").replace("　", "")
     s = s.replace("・", "").replace("･", "")
     s = s.replace("（", "(").replace("）", ")")
@@ -85,17 +88,27 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
-#  対象日の解決
+#  日付ユーティリティ
 # ─────────────────────────────────────────────────────────────
+def parse_jp_date(s: str):
+    """'2026/08/10' 等を date オブジェクトに変換。失敗時 None。"""
+    s = s.strip()
+    m = re.match(r"(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})", s)
+    if not m:
+        return None
+    y, mo, d = map(int, m.groups())
+    try:
+        return datetime(y, mo, d).date()
+    except ValueError:
+        return None
+
+
 def resolve_target_date():
-    """
-    TARGET_DATE 環境変数 (YYYYMMDD) を読み YYYY/MM/DD 形式で返す。
-    未指定・空欄の場合は None（呼び出し側で「最新日」として扱う）。
-    """
+    """TARGET_DATE 環境変数 (YYYYMMDD) → 'YYYY/MM/DD' 文字列 or None"""
     raw = os.environ.get("TARGET_DATE", "").strip()
     if raw and re.fullmatch(r"\d{8}", raw):
         d = f"{raw[:4]}/{raw[4:6]}/{raw[6:8]}"
-        log.info("対象日: %s（指定）", d)
+        log.info("対象日: %s（指定・以降を取得）", d)
         return d
     log.info("対象日: 未指定 → 各ページの最新日を自動取得")
     return None
@@ -142,66 +155,93 @@ def fetch(url):
 
 # ═════════════════════════════════════════════════════════════
 #  1. ToSTNeT 超大口約定情報
-#  ページ構造: 公表日(0) | 取引内容リンク(1)
-#  出力列:    公表日 | 取引日 | コード | 銘柄 | 価格 | 売買高 | 売買代金
+#  リンク先は xlsx。ヘッダー行を検出して動的に列マッピングする。
+#  出力列: 公表日 | 取引日 | コード | 銘柄 | 価格 | 売買高 | 売買代金
 # ═════════════════════════════════════════════════════════════
-def _parse_tostnet_xlsx(url, kouhyo_date):
-    """
-    ToSTNeT 超大口約定情報の xlsx をダウンロードしてパース。
-    出力: [[公表日, 取引日, コード, 銘柄, 価格, 売買高, 売買代金], ...]
-    """
-    import io
-    import openpyxl
+_TOSTNET_HDR_KEYS = {
+    "code":   ["コード"],
+    "name":   ["銘柄", "会社名"],
+    "date":   ["取引日", "約定日", "売買日"],
+    "price":  ["価格", "値段", "約定値段"],
+    "volume": ["出来高", "売買高", "数量"],
+    "value":  ["代金", "売買代金"],
+}
 
+
+def _detect_xlsx_header(rows):
+    """
+    2次元セル配列からヘッダー行を検出し、列インデックスマップを返す。
+    見つからない場合は (None, {}) を返す。
+    """
+    for i, row in enumerate(rows[:15]):
+        cells = ["" if c is None else str(c).strip() for c in row]
+        joined = "".join(cells)
+        if "コード" in joined and ("価格" in joined or "値段" in joined):
+            col = {}
+            for j, c in enumerate(cells):
+                for key, keywords in _TOSTNET_HDR_KEYS.items():
+                    if key in col:
+                        continue
+                    if any(kw in c for kw in keywords):
+                        col[key] = j
+            if "code" in col:
+                return i, col
+    return None, {}
+
+
+def _parse_tostnet_xlsx(url, kouhyo_date):
     resp = requests.get(url, headers=HTTP_HEADERS, timeout=60)
     resp.raise_for_status()
 
+    import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(resp.content), data_only=True)
     out = []
 
     for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
         log.info("  [xlsx] シート '%s' (%d行 x %d列)",
-                 ws.title, ws.max_row, ws.max_column)
+                 ws.title, len(rows), ws.max_column)
 
-        for row in ws.iter_rows(values_only=True):
+        header_idx, col = _detect_xlsx_header(rows)
+
+        if header_idx is None:
+            log.info("  [xlsx] ヘッダー未検出 → 先頭6行をダンプ")
+            for j, row in enumerate(rows[:6]):
+                cells = ["" if c is None else str(c) for c in row]
+                log.info("    row[%d]: %s", j, [c[:20] for c in cells])
+            continue
+
+        log.info("  [xlsx] ヘッダー行=%d 列マップ=%s", header_idx, col)
+
+        for row in rows[header_idx + 1:]:
             cells = ["" if c is None else str(c).strip() for c in row]
             if not any(cells):
                 continue
 
-            # 4桁コードを含む列を探す
-            code_idx = None
-            for i, c in enumerate(cells):
-                # 数値セルは '1234' or '1234.0' の形になり得る
-                c2 = c.split(".")[0] if "." in c else c
-                if re.fullmatch(r"\d{4}", c2):
-                    code_idx = i
-                    break
-
-            if code_idx is None:
+            code_raw = cells[col["code"]] if "code" in col and col["code"] < len(cells) else ""
+            code = code_raw.split(".")[0]
+            if not re.fullmatch(r"\d{4}", code):
                 continue
 
-            code = cells[code_idx].split(".")[0]
-            # コード列の前=取引日、後ろ=銘柄/価格/売買高/売買代金 と想定
-            torihiki = cells[code_idx - 1] if code_idx >= 1 else ""
-            rest = cells[code_idx + 1: code_idx + 5]
-            rest += [""] * (4 - len(rest))
+            def g(key, default=""):
+                idx = col.get(key)
+                if idx is None or idx >= len(cells):
+                    return default
+                return cells[idx]
 
-            out.append([kouhyo_date, torihiki, code,
-                        rest[0], rest[1], rest[2], rest[3]])
+            torihiki = g("date")
+            name     = g("name")
+            price    = g("price")
+            volume   = g("volume")
+            value    = g("value")
 
-    if not out:
-        # デバッグ: xlsx の先頭数行を出力
-        ws = wb.worksheets[0]
-        log.info("  [DEBUG xlsx] 先頭6行:")
-        for j, row in enumerate(ws.iter_rows(max_row=6, values_only=True)):
-            log.info("    row[%d]: %s", j,
-                     [str(c)[:20] if c is not None else "" for c in row])
+            out.append([kouhyo_date, torihiki, code, name, price, volume, value])
 
     return out
 
 
 def _parse_tostnet_html(soup, kouhyo_date):
-    """リンク先が HTML の場合のフォールバックパーサ"""
+    """リンク先が HTML の場合のフォールバック"""
     out = []
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
@@ -210,7 +250,7 @@ def _parse_tostnet_html(soup, kouhyo_date):
                 continue
             for idx, c in enumerate(cells):
                 if re.fullmatch(r"\d{4}", c) and idx >= 1:
-                    row = [kouhyo_date] + cells[max(0, idx-1): idx+6]
+                    row = [kouhyo_date] + cells[max(0, idx - 1): idx + 6]
                     if len(row) >= 7:
                         out.append(row[:7])
                     break
@@ -219,11 +259,12 @@ def _parse_tostnet_html(soup, kouhyo_date):
 
 def scrape_tostnet(target_date=None):
     """
-    target_date (YYYY/MM/DD): 指定日のリンクを追う
-    None: テーブルの最新行（先頭）のリンクを追う
+    target_date (YYYY/MM/DD): この日付「以降」の公表日を対象にリンクを追う
+    None: テーブル最上行（最新日）のみ
     """
     soup = fetch(TOSTNET_URL)
     out = []
+    target_d = parse_jp_date(target_date) if target_date else None
 
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
@@ -234,16 +275,16 @@ def scrape_tostnet(target_date=None):
             if not DATE_PAT.match(kouhyo):
                 continue
 
-            # 日付フィルタ
-            if target_date and kouhyo != target_date:
-                continue
+            kouhyo_d = parse_jp_date(kouhyo)
+            if target_d and kouhyo_d and kouhyo_d < target_d:
+                continue   # 指定日より過去はスキップ（未来日は含む）
+            if not target_d:
+                pass  # 最新行のみ後段の break で担保
 
             link_tag = tds[1].find("a", href=True) if len(tds) > 1 else None
             if not link_tag:
-                log.info("  ToSTNeT: %s にリンクなし → セルHTML: %s",
-                         kouhyo, str(tds[1])[:200] if len(tds) > 1 else "N/A")
-                if not target_date:
-                    break   # 最新日のみ試みて終了
+                if not target_d:
+                    break
                 continue
 
             href = link_tag["href"]
@@ -254,16 +295,14 @@ def scrape_tostnet(target_date=None):
             try:
                 if href.lower().endswith((".xlsx", ".xls")):
                     rows = _parse_tostnet_xlsx(href, kouhyo)
-                    log.info("  xlsx: %d 件取得", len(rows))
                 else:
-                    detail_soup = fetch(href)
-                    rows = _parse_tostnet_html(detail_soup, kouhyo)
-                    log.info("  HTML: %d 件取得", len(rows))
+                    rows = _parse_tostnet_html(fetch(href), kouhyo)
+                log.info("  → %d 件取得", len(rows))
                 out.extend(rows)
             except Exception as e:
                 log.warning("  取得失敗: %s", e, exc_info=True)
 
-            if not target_date:
+            if not target_d:
                 break   # 最新日のみ
 
     return out
@@ -277,7 +316,6 @@ def run_tostnet(ss, target_date):
         log.warning("  データなし → スキップ")
         return
     ws = get_ws(ss, GID_TOSTNET)
-    # 重複チェック（公表日で比較）
     cur = ws.row_values(2)
     if cur and rows and cur[0] == rows[0][0] and not target_date:
         log.info("  既挿入済み (%s) → スキップ", rows[0][0])
@@ -287,12 +325,10 @@ def run_tostnet(ss, target_date):
 
 # ═════════════════════════════════════════════════════════════
 #  2. 自己株式立会外買付取引情報
-#  ページ構造（実測）5列:
-#    実施日 | 銘柄名（コード） | 値段 | 買付数量 | 約定数量
+#  実施日が target_date「以降」（未来日含む）の全行を取得
 #  出力列: 公表日(今日) | 実施日 | コード | 銘柄 | 価格 | 買付数量 | 約定数量
 # ═════════════════════════════════════════════════════════════
 def _parse_name_code(text):
-    """'銘柄名（コード）　株式' → ('銘柄名', 'コード')"""
     m = re.search(r"[（(](\d{4})[）)]", text)
     code = m.group(1) if m else ""
     name = text[:m.start()].strip() if m else text
@@ -301,12 +337,9 @@ def _parse_name_code(text):
 
 
 def scrape_own_shares(target_date=None):
-    """
-    target_date (YYYY/MM/DD): 実施日でフィルタ
-    None: 全行取得
-    """
     soup = fetch(OWN_SHARES_URL)
     today = datetime.now(JST).strftime("%Y/%m/%d")
+    target_d = parse_jp_date(target_date) if target_date else None
     out = []
 
     for tbl in soup.find_all("table"):
@@ -318,9 +351,10 @@ def scrape_own_shares(target_date=None):
             if not DATE_PAT.match(jisshi):
                 continue
 
-            # 日付フィルタ
-            if target_date and jisshi != target_date:
-                continue
+            if target_d:
+                jisshi_d = parse_jp_date(jisshi)
+                if jisshi_d and jisshi_d < target_d:
+                    continue   # 指定日より過去はスキップ（未来日は含む）
 
             name_code = tds[1].get_text(strip=True)
             price     = tds[2].get_text(strip=True)
@@ -328,7 +362,6 @@ def scrape_own_shares(target_date=None):
             exec_qty  = tds[4].get_text(strip=True) if len(tds) > 4 else ""
 
             name, code = _parse_name_code(name_code)
-            # 公表日はページに存在しないため当日 JST を使用
             out.append([today, jisshi, code, name, price, buy_qty, exec_qty])
 
     return out
@@ -342,7 +375,6 @@ def run_own_shares(ss, target_date):
         log.warning("  データなし → スキップ")
         return
     ws = get_ws(ss, GID_OWN_SHARES)
-    # 重複チェック（実施日=B列で比較）
     cur = ws.row_values(2)
     if cur and len(cur) > 1 and rows and cur[1] == rows[0][1] and not target_date:
         log.info("  既挿入済み (実施日: %s) → スキップ", rows[0][1])
@@ -352,33 +384,37 @@ def run_own_shares(ss, target_date):
 
 # ═════════════════════════════════════════════════════════════
 #  3. 業種別 33 業種指数  ※JS レンダリング → Playwright 使用
-#  ヘッダー（実測）: 指数名(0) 現在値(1) 前日比(2) 始値(3) 高値(4) 安値(5)
+#  実測列順: 0=指数名 1=現在値 2=前日比(値) 3=前日比(%) 4=始値 5=高値 6=安値
 # ═════════════════════════════════════════════════════════════
 def _parse_sector_html(soup):
     max_idx = max(SECTOR_COL.values())
     out, seen = [], set()
+
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
             if len(cells) <= max_idx:
                 continue
+
             name = cells[SECTOR_COL["name"]]
             if not name or name in SKIP_NAMES:
                 continue
+
             cur = cells[SECTOR_COL["current"]]
             if not cur or cur in SKIP_NAMES:
                 continue
             if not re.search(r"[\d０-９,，.]", cur):
                 continue
-            # ── 33業種ホワイトリストで絞り込み ──
+
             key = _norm(name)
             if key not in SECTOR33_NORM:
                 continue
-            canonical = SECTOR33_NORM[key]   # 正式名称に統一
+            canonical = SECTOR33_NORM[key]
 
             if canonical in seen:
                 continue
             seen.add(canonical)
+
             out.append({
                 "name":    canonical,
                 "current": cur,
@@ -387,7 +423,6 @@ def _parse_sector_html(soup):
                 "open":    cells[SECTOR_COL["open"]],
             })
 
-    # SECTOR33 の定義順にソート（毎回同じ行順を保証）
     order = {n: i for i, n in enumerate(SECTOR33)}
     out.sort(key=lambda d: order.get(d["name"], 999))
     return out
@@ -414,7 +449,6 @@ def _fetch_with_playwright():
 
 
 def scrape_sector():
-    # まず requests で試す（週次バッチ等で静的 HTML になる場合に対応）
     soup = fetch(SECTOR_URL)
     data = _parse_sector_html(soup)
     if not data:
@@ -424,16 +458,27 @@ def scrape_sector():
             soup2 = BeautifulSoup(html, "html.parser")
             data = _parse_sector_html(soup2)
             log.info("  Playwright後: %d 業種", len(data))
-            if not data:
+
+            if data:
+                # 検証用: 最初の1件の生セルをログ出力（列ズレ確認用）
+                for tbl in soup2.find_all("table"):
+                    for tr in tbl.find_all("tr"):
+                        cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+                        if len(cells) > max(SECTOR_COL.values()) and cells[0] == data[0]["name"]:
+                            log.info("  [検証] %s の生データ: %s", data[0]["name"], cells[:8])
+                            break
+                    else:
+                        continue
+                    break
+            else:
                 tables = soup2.find_all("table")
                 log.info("  [DEBUG Playwright後] テーブル数=%d", len(tables))
                 for i, tbl in enumerate(tables[:4]):
                     trs = tbl.find_all("tr")
-                    log.info("    table[%d]: %d行", i, len(trs))
                     for j, tr in enumerate(trs[:3]):
-                        cells = [c.get_text(strip=True) for c in tr.find_all(["th","td"])]
-                        log.info("      row[%d] %d列: %s", j, len(cells),
-                                 [c[:20] for c in cells])
+                        cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+                        log.info("    table[%d] row[%d] %d列: %s",
+                                 i, j, len(cells), [c[:20] for c in cells])
         except ImportError:
             log.error("  Playwright 未インストール")
         except Exception as e:
@@ -463,12 +508,14 @@ def run_sector(ss):
     if not data:
         log.warning("  データなし → スキップ")
         return
+
     ws = get_ws(ss, GID_SECTOR)
     today = datetime.now(JST).strftime("%Y/%m/%d")
     marker = (ws.acell(SECTOR_MARKER).value or "").strip()
     if marker == today:
         log.info("  既挿入済み (%s) → スキップ", today)
         return
+
     insert_col_c(ss, ws)
     time.sleep(1.5)
     for metric, start_row in SECTOR_ROWS.items():
@@ -485,7 +532,7 @@ def main():
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
     log.info("━━━ JPX 一括スクレイプ 開始: %s ━━━", now)
 
-    target_date = resolve_target_date()   # None = 最新日自動
+    target_date = resolve_target_date()
 
     gc = build_gc()
     ss = open_ss(gc)
@@ -493,7 +540,7 @@ def main():
     tasks = [
         ("ToSTNeT 超大口",     lambda: run_tostnet(ss, target_date)),
         ("自己株式立会外買付", lambda: run_own_shares(ss, target_date)),
-        ("業種別 33 業種指数", lambda: run_sector(ss)),   # 日付指定なし（リアルタイム）
+        ("業種別 33 業種指数", lambda: run_sector(ss)),
     ]
     for label, fn in tasks:
         log.info("▶ %s", label)
