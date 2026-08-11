@@ -56,11 +56,30 @@ REQUEST_HEADERS = {
 # ============================================================
 def get_gspread_client():
     """環境変数 or credentials.json から認証"""
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    # 既存ワークフローとの互換性のため、複数の環境変数名を順に試す
+    env_candidates = [
+        "GOOGLE_CREDENTIALS_JSON",
+        "GCP_SA_KEY",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "GSPREAD_CREDENTIALS",
+        "GOOGLE_SERVICE_ACCOUNT_KEY",
+        "SERVICE_ACCOUNT_JSON",
+    ]
+    creds_json = None
+    used_var = None
+    for var_name in env_candidates:
+        val = os.environ.get(var_name)
+        if val:
+            creds_json = val
+            used_var = var_name
+            break
+
     if creds_json:
+        print(f"    認証情報: 環境変数 '{used_var}' を使用")
         creds_info = json.loads(creds_json)
     else:
         creds_path = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+        print(f"    認証情報: 環境変数が見つからないため '{creds_path}' を使用")
         with open(creds_path) as f:
             creds_info = json.load(f)
 
