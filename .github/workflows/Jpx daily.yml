@@ -2,9 +2,9 @@ name: JPX 日報 株式相場表 取得
 
 on:
   schedule:
-    # 日本時間(JST, UTC+9) 平日20:00に実行。
-    # GitHub Actionsのcron指定はUTC基準。20:00 JST = 11:00 UTC(同一日内に収まるため曜日のずれなし)。
-    # cron の曜日は 0=日,1=月,...,6=土 なので、月〜金 = 1-5。
+    # 日本時間(JST, UTC+9) 平日20:00に実行
+    # GitHub Actionsのcronは UTC 基準。20:00 JST = 11:00 UTC(同一日内に収まるため曜日のずれなし)
+    # cron の曜日は 0=日,1=月,...,6=土 なので、月〜金 = 1-5
     - cron: "0 11 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -13,14 +13,15 @@ on:
         required: false
         default: ""
       force:
-        description: "同日データが既にある場合も強制的に再書き込みする"
+        description: "同じ日付列が既にある場合も強制的に再挿入する"
         required: false
         default: "false"
         type: boolean
 
 jobs:
-  fetch:
+  fetch-jpx-daily:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,12 +29,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        working-directory: scripts/daily
+        run: pip install -r "Requirements.txt"
 
-      - name: Run scraper
+      - name: JPX日報を取得してスプレッドシートに書き込み
+        working-directory: scripts/daily
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}  # 未設定でもOK(スクリプト内デフォルトを使用)
@@ -45,4 +48,4 @@ jobs:
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             ARGS="$ARGS --force"
           fi
-          python fetch_jpx_daily.py $ARGS
+          python "Fetch jpx daily.py" $ARGS
