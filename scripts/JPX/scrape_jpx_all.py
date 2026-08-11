@@ -71,7 +71,7 @@ log = logging.getLogger(__name__)
 #  Google Sheets ユーティリティ
 # ─────────────────────────────────────────────────────────────
 def build_gc():
-    info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     return gspread.service_account_from_dict(info)
 
 
