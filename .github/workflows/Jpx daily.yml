@@ -1,0 +1,48 @@
+name: JPX 日報 株式相場表 取得
+
+on:
+  schedule:
+    # 日本時間(JST, UTC+9) 平日20:00に実行。
+    # GitHub Actionsのcron指定はUTC基準。20:00 JST = 11:00 UTC(同一日内に収まるため曜日のずれなし)。
+    # cron の曜日は 0=日,1=月,...,6=土 なので、月〜金 = 1-5。
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "取得したい日付 (YYYY-MM-DD)。空欄なら最新日を自動取得。"
+        required: false
+        default: ""
+      force:
+        description: "同日データが既にある場合も強制的に再書き込みする"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}  # 未設定でもOK(スクリプト内デフォルトを使用)
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          python fetch_jpx_daily.py $ARGS
