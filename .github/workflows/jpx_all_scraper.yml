@@ -19,32 +19,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python セットアップ
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 依存ライブラリ インストール
-        run: |
-          pip install \
-            "requests>=2.31.0" \
-            "beautifulsoup4>=4.12.0" \
-            "gspread>=6.0.0" \
-            "google-auth>=2.27.0"
-
-      - name: シークレット確認
-        env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-        run: |
-          if [ -z "$GOOGLE_CREDENTIALS_JSON" ]; then
-            echo "::error::GOOGLE_CREDENTIALS_JSON が未設定です"
-            echo "Settings → Secrets and variables → Actions でシークレットを追加してください"
-            exit 1
-          fi
-          echo "✓ GOOGLE_CREDENTIALS_JSON が設定されています (${#GOOGLE_CREDENTIALS_JSON} 文字)"
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
 
       - name: JPX スクレイプ実行
         env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           TZ: Asia/Tokyo
         run: python scripts/JPX/scrape_jpx_all.py
