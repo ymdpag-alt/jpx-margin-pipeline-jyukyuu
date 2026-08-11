@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-JPX 一括スクレイパー  v1.0
+JPX 一括スクレイパー  v1.2
   1. ToSTNeT 超大口約定情報       → GID 1044963009
   2. 自己株式立会外買付取引情報   → GID 2116229549
   3. 業種別 33 業種指数           → GID 742855575
@@ -31,22 +31,22 @@ TOSTNET_URL    = "https://www.jpx.co.jp/markets/equities/tostnet/index.html"
 OWN_SHARES_URL = "https://www.jpx.co.jp/markets/equities/off-auction-ownshares/index.html"
 SECTOR_URL     = "https://www.jpx.co.jp/markets/indices/realvalues/"
 
-# 業種別指数シート: 各指標の開始行 (1-indexed, 33 業種分)
-SECTOR_ROWS = {
-    "current": 1,    # 現在値
-    "low":     40,   # 安値
-    "high":    80,   # 高値
-    "open":    120,  # 始値
-}
-SECTOR_LABELS = {
-    "current": "現在値",
-    "low":     "安値",
-    "high":    "高値",
-    "open":    "始値",
-}
-SECTOR_MARKER = "A35"   # 重複チェック用マーカーセル (空白行)
+SECTOR_ROWS = {"current": 1, "low": 40, "high": 80, "open": 120}
+SECTOR_LABELS = {"current": "現在値", "low": "安値", "high": "高値", "open": "始値"}
+SECTOR_MARKER = "A35"
 
 JST = timezone(timedelta(hours=9))
+
+# 日付パターン（YYYY/MM/DD, YYYY-MM-DD, YYYY年MM月DD日）
+DATE_PAT = re.compile(r"^\d{4}[/\-年]\d{1,2}[/\-月]\d{1,2}")
+
+# セクター指数ヘッダーとして除外するキーワード
+HEADER_WORDS = frozenset([
+    "指数名", "銘柄", "業種", "指数", "Index", "Name",
+    "現在値", "前日比", "騰落率", "高値", "安値", "始値", "前日終値",
+    "Current", "Change", "High", "Low", "Open", "Close",
+    "", "-", "－", "−", "ー", "※",
+])
 
 HTTP_HEADERS = {
     "User-Agent": (
@@ -68,40 +68,32 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
-#  Google Sheets ユーティリティ
+#  Google Sheets
 # ─────────────────────────────────────────────────────────────
 def build_gc():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     return gspread.service_account_from_dict(info)
 
-
 def open_ss(gc):
     return gc.open_by_key(SPREADSHEET_ID)
-
 
 def get_ws(ss, gid):
     for ws in ss.worksheets():
         if ws.id == gid:
             return ws
-    raise ValueError(f"GID {gid} not found in spreadsheet")
-
+    raise ValueError(f"GID {gid} not found")
 
 def prepend_rows(ws, rows):
-    """row=2 に新データを挿入し、既存データを下シフト"""
     ws.insert_rows(rows, row=2, value_input_option="USER_ENTERED")
     log.info("    ✓ %d 行を row=2 に挿入", len(rows))
 
-
 def insert_col_c(ss, ws):
-    """列 C に空列を挿入し、既存 C 以降を右シフト"""
     ss.batch_update({
         "requests": [{
             "insertDimension": {
                 "range": {
-                    "sheetId":    ws.id,
-                    "dimension":  "COLUMNS",
-                    "startIndex": 2,   # A=0, B=1, C=2
-                    "endIndex":   3,
+                    "sheetId": ws.id, "dimension": "COLUMNS",
+                    "startIndex": 2, "endIndex": 3,
                 },
                 "inheritFromBefore": False,
             }
@@ -111,13 +103,26 @@ def insert_col_c(ss, ws):
 
 
 # ─────────────────────────────────────────────────────────────
-#  HTTP
+#  HTTP + デバッグ
 # ─────────────────────────────────────────────────────────────
 def fetch(url):
     resp = requests.get(url, headers=HTTP_HEADERS, timeout=30)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
     return BeautifulSoup(resp.text, "html.parser")
+
+
+def debug_tables(soup, label):
+    """テーブル構造をログ出力（スクレイプ失敗時の診断用）"""
+    tables = soup.find_all("table")
+    log.info("  [DEBUG %s] テーブル数=%d", label, len(tables))
+    for i, tbl in enumerate(tables[:4]):
+        trs = tbl.find_all("tr")
+        log.info("    table[%d]: %d行", i, len(trs))
+        for j, tr in enumerate(trs[:4]):
+            cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+            log.info("      row[%d] %d列: %s",
+                     j, len(cells), [c[:20] for c in cells])
 
 
 # ═════════════════════════════════════════════════════════════
@@ -127,21 +132,28 @@ def fetch(url):
 def scrape_tostnet():
     soup = fetch(TOSTNET_URL)
     out = []
+
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+
+            # ── 方法A: 公表日(0列目)が日付パターン ──
+            if len(cells) >= 7 and DATE_PAT.match(cells[0]):
+                out.append(cells[:7])
+                continue
+
+            # ── 方法B: 4桁コードが index=2 ──
             if len(cells) >= 7 and re.fullmatch(r"\d{4}", cells[2]):
                 out.append(cells[:7])
+                continue
 
-    # フォールバック: コードが index=3 にある場合
+            # ── 方法C: 4桁コードが index=3（市場名列がある場合）──
+            if len(cells) >= 8 and re.fullmatch(r"\d{4}", cells[3]):
+                out.append([cells[1], cells[2], cells[3],
+                            cells[4], cells[5], cells[6], cells[7]])
+
     if not out:
-        log.info("  index=2 で取得なし → index=3 でリトライ")
-        for tbl in soup.find_all("table"):
-            for tr in tbl.find_all("tr"):
-                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(cells) >= 8 and re.fullmatch(r"\d{4}", cells[3]):
-                    out.append([cells[1], cells[2], cells[3],
-                                cells[4], cells[5], cells[6], cells[7]])
+        debug_tables(soup, "ToSTNeT")
     return out
 
 
@@ -152,7 +164,6 @@ def run_tostnet(ss):
     if not rows:
         log.warning("  データなし → スキップ")
         return
-
     ws = get_ws(ss, GID_TOSTNET)
     cur = ws.row_values(2)
     if cur and cur[0] == rows[0][0]:
@@ -168,20 +179,25 @@ def run_tostnet(ss):
 def scrape_own_shares():
     soup = fetch(OWN_SHARES_URL)
     out = []
+
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+
+            if len(cells) >= 7 and DATE_PAT.match(cells[0]):
+                out.append(cells[:7])
+                continue
+
             if len(cells) >= 7 and re.fullmatch(r"\d{4}", cells[2]):
                 out.append(cells[:7])
+                continue
+
+            if len(cells) >= 8 and re.fullmatch(r"\d{4}", cells[3]):
+                out.append([cells[1], cells[2], cells[3],
+                            cells[4], cells[5], cells[6], cells[7]])
 
     if not out:
-        log.info("  index=2 で取得なし → index=3 でリトライ")
-        for tbl in soup.find_all("table"):
-            for tr in tbl.find_all("tr"):
-                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(cells) >= 8 and re.fullmatch(r"\d{4}", cells[3]):
-                    out.append([cells[1], cells[2], cells[3],
-                                cells[4], cells[5], cells[6], cells[7]])
+        debug_tables(soup, "自己株式")
     return out
 
 
@@ -192,7 +208,6 @@ def run_own_shares(ss):
     if not rows:
         log.warning("  データなし → スキップ")
         return
-
     ws = get_ws(ss, GID_OWN_SHARES)
     cur = ws.row_values(2)
     if cur and cur[0] == rows[0][0]:
@@ -216,7 +231,7 @@ def detect_sector_cols(soup):
                 continue
             col = {}
             for i, h in enumerate(hdrs):
-                if ("指数" in h or "銘柄" in h) and "name" not in col:
+                if ("指数" in h or "銘柄" in h or "業種" in h) and "name" not in col:
                     col["name"] = i
                 elif "現在値" in h and "current" not in col:
                     col["current"] = i
@@ -245,21 +260,36 @@ def scrape_sector():
             cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
             if len(cells) <= max_idx:
                 continue
+
             name = cells[col["name"]]
-            if not name or not re.search(r"[\u3040-\u9fff]", name):
+
+            # ── ヘッダー行・空行を除外（日本語縛りを廃止）──
+            if not name or name in HEADER_WORDS:
                 continue
-            if not re.search(r"[\d,.]", cells[col["current"]]):
+
+            cur = cells[col["current"]]
+            if not cur or cur in HEADER_WORDS:
                 continue
+
+            # ── 現在値に数字が含まれることを確認 ──
+            if not re.search(r"[\d０-９]", cur):
+                continue
+
             if name in seen:
                 continue
             seen.add(name)
+
             out.append({
                 "name":    name,
-                "current": cells[col["current"]],
+                "current": cur,
                 "high":    cells[col["high"]],
                 "low":     cells[col["low"]],
                 "open":    cells[col["open"]],
             })
+
+    if not out:
+        debug_tables(soup, "業種別指数")
+
     return out
 
 
@@ -267,18 +297,12 @@ def write_sector_block(ws, data, metric, start_row):
     n = len(data)
     if n == 0:
         return
-    ws.update(
-        f"A{start_row}:A{start_row + n - 1}",
-        [[d["name"]] for d in data],
-        value_input_option="USER_ENTERED",
-    )
-    ws.update(
-        f"C{start_row}:C{start_row + n - 1}",
-        [[d[metric]] for d in data],
-        value_input_option="USER_ENTERED",
-    )
-    log.info("    ✓ %s: row%d〜%d (%d 件)",
-             SECTOR_LABELS[metric], start_row, start_row + n - 1, n)
+    ws.update(f"A{start_row}:A{start_row+n-1}",
+              [[d["name"]] for d in data], value_input_option="USER_ENTERED")
+    ws.update(f"C{start_row}:C{start_row+n-1}",
+              [[d[metric]] for d in data], value_input_option="USER_ENTERED")
+    log.info("    ✓ %s: row%d〜%d (%d件)",
+             SECTOR_LABELS[metric], start_row, start_row+n-1, n)
     time.sleep(1.2)
 
 
@@ -292,7 +316,6 @@ def run_sector(ss):
 
     ws = get_ws(ss, GID_SECTOR)
     today = datetime.now(JST).strftime("%Y/%m/%d")
-
     marker = (ws.acell(SECTOR_MARKER).value or "").strip()
     if marker == today:
         log.info("  既挿入済み (%s) → スキップ", today)
