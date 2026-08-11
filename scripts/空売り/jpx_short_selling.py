@@ -33,6 +33,7 @@ import sys
 import time
 import unicodedata
 from typing import Any
+from urllib.parse import urljoin
 
 import gspread
 import pandas as pd
@@ -190,7 +191,7 @@ def fetch_file_index() -> dict[dt.date, str]:
         d = parse_date_like(m.group(1))
         if d is None:
             continue
-        url = href if href.startswith("http") else ORIGIN + ("" if href.startswith("/") else "/") + href.lstrip("/")
+        url = urljoin(INDEX_URL, href)
         found[d] = url
 
     if not found:
