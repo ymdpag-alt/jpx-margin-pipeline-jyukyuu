@@ -27,7 +27,10 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 JPX_BASE = "https://www.jpx.co.jp"
 JPX_PAGE_URL = f"{JPX_BASE}/markets/statistics-equities/margin/01.html"
-SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
+
+# スプレッドシートID（環境変数 SPREADSHEET_ID があればそちらを優先）
+DEFAULT_SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip() or DEFAULT_SPREADSHEET_ID
 
 # gspread で取得するシート設定 (シート名 → {gid, Excelの列キーワード})
 SHEET_CONFIG = {
@@ -57,26 +60,30 @@ REQUEST_HEADERS = {
 def get_gspread_client():
     """
     サービスアカウント認証情報を取得する。
-      1. 環境変数 GOOGLE_CREDENTIALS_JSON（GitHub Actions 用）
-      2. ローカルの credentials.json（ローカル実行用）
+      1. 環境変数 GOOGLE_SERVICE_ACCOUNT_JSON（既存パイプラインと共通）
+      2. 環境変数 GOOGLE_CREDENTIALS_JSON（予備）
+      3. ローカルの credentials.json（ローカル実行用）
     """
     creds_info = None
     source = None
 
-    # ── 1. 環境変数 ────────────────────────────────────
-    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if raw:
+    # ── 1-2. 環境変数（ワークフローで明示的に渡したものだけ）──
+    for var_name in ("GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_CREDENTIALS_JSON"):
+        raw = os.environ.get(var_name, "").strip()
+        if not raw:
+            continue
         try:
             creds_info = json.loads(raw)
-            source = "環境変数 GOOGLE_CREDENTIALS_JSON"
+            source = f"環境変数 {var_name}"
+            break
         except json.JSONDecodeError as e:
             raise RuntimeError(
-                f"GOOGLE_CREDENTIALS_JSON の JSON 解析に失敗しました: {e}\n"
+                f"{var_name} の JSON 解析に失敗しました: {e}\n"
                 "  Secret にはサービスアカウント JSON ファイルの中身を\n"
                 "  丸ごと（{ から } まで）ペーストしてください。"
             ) from e
 
-    # ── 2. ローカルファイル ────────────────────────────
+    # ── 3. ローカルファイル ────────────────────────────
     if creds_info is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         for candidate in [
@@ -97,16 +104,9 @@ def get_gspread_client():
             "サービスアカウント認証情報が見つかりませんでした。\n"
             "\n"
             "  【GitHub Actions で実行する場合】\n"
-            "   1. Settings → Secrets and variables → Actions を開く\n"
-            "   2. New repository secret をクリック\n"
-            "   3. Name に  GOOGLE_CREDENTIALS_JSON  と入力\n"
-            "   4. Secret にサービスアカウント JSON の中身を丸ごとペースト\n"
-            "   5. 対象スプレッドシートを、その JSON 内の client_email に\n"
-            "      『編集者』として共有する\n"
-            "\n"
-            "  ※ 既存のワークフローで別名の Secret を使っている場合は、\n"
-            "     このワークフローの env: を実際の名前に書き換えてください。\n"
-            "     例）GOOGLE_CREDENTIALS_JSON: ${{ secrets.実際の名前 }}\n"
+            "   ワークフローの env: に以下が設定されているか確認してください。\n"
+            "     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}\n"
+            "   Secret 名が異なる場合は、実際の名前に書き換えてください。\n"
             "\n"
             "  【ローカルで実行する場合】\n"
             "   credentials.json をスクリプトと同じ階層に配置してください。\n"
