@@ -41,7 +41,7 @@ from typing import Optional
 
 import requests
 
-JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/index.html"
+JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/00-archives-01.html"
 
 # ------------------------------------------------------------------
 # 1. JPXサイトから最新(または指定日)の「株式相場表」PDFリンクを取得
@@ -256,7 +256,9 @@ def parse_text(text: str) -> list[dict]:
         elif s in NON_INDUSTRY_OTHER_LINES:
             pass  # 市場の英語表記など、業種欄には転記しない
         else:
-            current_industry = s
+            # 業種見出しは "水産・農林業 Fishery,Agriculture & Forestry" のように
+            # 和文+英文が空白区切りで並んでいるため、和文部分(先頭トークン)のみを採用する
+            current_industry = s.split()[0] if s.split() else s
 
     if pending_record is not None:
         # 最終行がデータ行で終わっていて英文社名行が取得できなかった場合
@@ -314,6 +316,40 @@ def col_letter(n: int) -> str:
     return s
 
 
+def format_value(metric_key: str, raw: str) -> str:
+    """
+    シートに書き込む直前の値の整形。
+    出来高(volume)は千株単位で抽出しているため、実株数(×1000)に変換する。
+    """
+    if metric_key == "volume" and raw:
+        try:
+            v = float(raw.replace(",", "")) * 1000
+            return f"{v:,.0f}"
+        except ValueError:
+            return raw
+    return raw
+
+
+def ensure_header(ws, all_values: list[list[str]]) -> list[list[str]]:
+    """
+    A1:D1 が正しく設定されているか確認し、必要なら補完する。
+    シートが完全に空でない場合(例: E列以降に既存データがあるがA〜D列が未設定)でも
+    正しくヘッダーを補完できるよう、"シートが空かどうか"ではなく
+    "1行目のA〜D列の中身"を直接見て判定する。
+    """
+    if not all_values:
+        ws.update("A1:D1", [HEADER_ROW])
+        return [HEADER_ROW]
+
+    header = all_values[0]
+    header_ad = header[:4] if len(header) >= 4 else header + [""] * (4 - len(header))
+    if header_ad != HEADER_ROW:
+        ws.update("A1:D1", [HEADER_ROW])
+        header = HEADER_ROW + header[4:]
+        all_values = [header] + all_values[1:]
+    return all_values
+
+
 def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, force: bool = False):
     """
     1つの項目シート(ワイド形式)を更新する。
@@ -323,10 +359,7 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
     - 未登録の銘柄(新規コード)は最終行に新しい行として追加
     """
     all_values = ws.get_all_values()
-
-    if not all_values:
-        ws.update("A1:D1", [HEADER_ROW])
-        all_values = [HEADER_ROW]
+    all_values = ensure_header(ws, all_values)
 
     header = all_values[0]
     data_rows = all_values[1:]
@@ -349,7 +382,7 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
     for row in data_rows:
         code = row[0] if row else ""
         rec = records_by_code.get(code)
-        col_values.append(rec[metric_key] if rec else "")
+        col_values.append(format_value(metric_key, rec[metric_key]) if rec else "")
 
     # Step1: E列の前に空列を1つ挿入(既存の日付列は右にずれる)
     ws.spreadsheet.batch_update({
@@ -378,7 +411,7 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
         if r["code"] not in code_to_rowidx:
             new_rows.append([
                 r["code"], r["name_jp"], r["industry"] or "", r["market"] or "",
-                r[metric_key],
+                format_value(metric_key, r[metric_key]),
             ])
     if new_rows:
         ws.append_rows(new_rows, value_input_option="USER_ENTERED")
@@ -408,7 +441,7 @@ def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = Fals
         sample = records[0]
         for name, _gid, key in SHEET_SPECS:
             print(f"  - {name}: 例 {sample['code']} {sample['name_jp']} "
-                  f"(業種:{sample['industry']} / 市場:{sample['market']}) = {sample[key]}")
+                  f"(業種:{sample['industry']} / 市場:{sample['market']}) = {format_value(key, sample[key])}")
         return
 
     gc = get_gspread_client()
