@@ -42,7 +42,8 @@ jobs:
 
       - name: Run fetch script
         env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # 全 Secret をまとめて渡す（Secret名に依存せず自動検出するため）
+          ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
           CMD="python scripts/品貸料/fetch_hinkatsu.py"
 
