@@ -1,0 +1,56 @@
+name: JPX 空売り残高取込
+
+on:
+  schedule:
+    # JPX は毎営業日 17:00 JST 目処に掲載。JST 17:30 と 18:30 の2回試行（UTC 表記）
+    - cron: "30 8 * * 1-5"
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "取得する公表日 (YYYY-MM-DD)。空欄なら最新"
+        required: false
+        default: ""
+      dry_run:
+        description: "書き込まずに動作確認する"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: karauri-zandaka
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      TZ: Asia/Tokyo
+      SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID || '1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY' }}
+      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+      TARGET_DATE: ${{ github.event.inputs.target_date }}
+      DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+      RATIO_AS_PERCENT: "1"
+      MAX_DATE_COLS: "300"
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: "scripts/空売り/requirements.txt"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "scripts/空売り/requirements.txt"
+
+      - name: Run scraper
+        run: python "scripts/空売り/jpx_short_selling.py"
