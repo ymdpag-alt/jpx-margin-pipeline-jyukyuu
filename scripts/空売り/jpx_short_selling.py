@@ -53,7 +53,7 @@ from google.oauth2.service_account import Credentials
 # --------------------------------------------------------------------------
 JST = dt.timezone(dt.timedelta(hours=9))
 ORIGIN = "https://www.jpx.co.jp"
-INDEX_URL = f"{ORIGIN}/markets/public/short-selling/00-archives-01.html"
+INDEX_URL = f"{ORIGIN}/markets/public/short-selling/index.html"
 
 # SPREADSHEET_ID 環境変数が未設定の場合に使うデフォルト
 DEFAULT_SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
