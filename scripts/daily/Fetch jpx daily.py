@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+JPX 東京証券取引所日報(株式相場表)を毎日取得し、Google スプレッドシートに書き込むスクリプト。
+
+対象データ (銘柄ごと):
+    コード, 銘柄名(和文/英文), 業種, 市場区分, 前場 始値/高値/安値/終値, 後場 始値/高値/安値/終値,
+    VWAP(売買高加重平均価格), 出来高(千株)
+
+出力先: Google スプレッドシート 10シート (項目ごとに1シート、gidで指定)
+    前場始値 / 前場高値 / 前場安値 / 前場終値
+    後場始値 / 後場高値 / 後場安値 / 後場終値
+    VWAP / 出来高
+
+各シートの列構成(ワイド形式): A=コード, B=銘柄名, C=業種, D=市場, E列以降=日付ごとの値
+    - A〜D列は銘柄が初めて登場したときのみ書き込み、以降は変更しない
+    - 新しい日付のデータはE列に挿入し、既存の日付列は右にずれていく
+    - 当日データが取得できなかった銘柄は、その日の列を空欄にする
+    - まだシートに存在しない銘柄(新規コード)は最終行に新しい行として追加する
+
+実行方法:
+    python fetch_jpx_daily.py                     # 最新日を自動検出して取得
+    python fetch_jpx_daily.py --date 2026-08-06    # 特定日を指定して取得(バックフィル用)
+    python fetch_jpx_daily.py --dry-run            # スプレッドシートに書き込まず件数だけ確認
+    python fetch_jpx_daily.py --force              # 同じ日付列が既にあっても強制的に挿入し直す
+
+必要な環境変数:
+    GOOGLE_SERVICE_ACCOUNT_JSON : サービスアカウントのJSON鍵(文字列そのもの)
+    SPREADSHEET_ID              : (任意) 書き込み先スプレッドシートIDを上書きしたい場合のみ指定
+"""
+
+import argparse
+import io
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, date
+from typing import Optional
+
+import requests
+
+JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/index.html"
+
+# ------------------------------------------------------------------
+# 1. JPXサイトから最新(または指定日)の「株式相場表」PDFリンクを取得
+# ------------------------------------------------------------------
+
+def find_pdf_url(target_date: Optional[date] = None) -> tuple[str, date]:
+    """
+    JPX日報indexページをスクレイピングし、株式相場表(stq_YYYYMMDD.pdf)へのリンクを取得する。
+    target_date を指定した場合はその日付の行を探す。指定しない場合は一覧の最初(最新)を返す。
+    """
+    from bs4 import BeautifulSoup
+
+    resp = requests.get(JPX_INDEX_URL, timeout=30)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    ymd_re = re.compile(r"stq_(\d{8})\.pdf")
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        m = ymd_re.search(a["href"])
+        if m:
+            d = datetime.strptime(m.group(1), "%Y%m%d").date()
+            url = a["href"] if a["href"].startswith("http") else "https://www.jpx.co.jp" + a["href"]
+            candidates.append((d, url))
+
+    if not candidates:
+        raise RuntimeError("JPX日報indexページから株式相場表PDFリンクを検出できませんでした。"
+                            "サイト構造が変更された可能性があります。")
+
+    candidates.sort(key=lambda x: x[0], reverse=True)  # 新しい日付順
+
+    if target_date is None:
+        return candidates[0][1], candidates[0][0]
+
+    for d, url in candidates:
+        if d == target_date:
+            return url, d
+
+    raise RuntimeError(f"指定日 {target_date} の株式相場表PDFが見つかりませんでした"
+                        "(休場日、まだ掲載されていない、または一覧の表示範囲外の可能性があります)。")
+
+
+# ------------------------------------------------------------------
+# 2. PDFダウンロード & テキスト抽出
+# ------------------------------------------------------------------
+
+def download_pdf(url: str) -> bytes:
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    import pdfplumber
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            text_parts.append(t)
+    return "\n".join(text_parts)
+
+
+# ------------------------------------------------------------------
+# 3. テキストパース
+# ------------------------------------------------------------------
+
+CODE_NAME_RE = re.compile(r'^(?P<code>[0-9][0-9A-Za-z]{3})\s+(?P<name_jp>\S.+)$')
+
+NUM = r'[\d,]+(?:\.\d+)?'
+DATA_LINE_RE = re.compile(
+    r'^(?P<unit>\d+)\s+'
+    r'(?P<am_open>' + NUM + r')\s+'
+    r'(?P<am_high>' + NUM + r')\s+'
+    r'(?P<am_low>' + NUM + r')\s+'
+    r'(?P<am_close>' + NUM + r')\s+'
+    r'(?P<pm_open>' + NUM + r')\s+'
+    r'(?P<pm_high>' + NUM + r')\s+'
+    r'(?P<pm_low>' + NUM + r')\s+'
+    r'(?P<pm_close>' + NUM + r')\s+'
+    r'(?P<final_quote>[－ー―]|' + NUM + r')\s+'
+    r'(?P<net_change>-?' + NUM + r')\s+'
+    r'(?P<vwap>' + NUM + r')\s+'
+    r'(?P<volume>' + NUM + r')\s+'
+    r'(?P<value>' + NUM + r')\s*$'
+)
+
+HEADER_JUNK_EXACT = {
+    "株 式 相 場 表", "Stock Quotations",
+    "立 会 市 場 普 通 取 引", "Auction Trades Regular Way",
+    "千円[￥thous.]", "Trading Value", "千株[thous.shs.]",
+    "千口/千個[thous.units.]", "Trading Volume",
+    "円[￥]", "Net Change", "Final special quote",
+    "売買高 売買代金", "Close", "最終気配 前日比 終値",
+    "Low", "安値", "High", "高値", "Open", "始値 銘柄名", "Issues",
+    "売買", "単位", "Trading", "Unit Code", "コード",
+    "午前 (The morning trading session) 午後 (The afternoon trading session)",
+    "始値", "高値", "安値", "終値",
+    "円[￥] 円[￥] 円[￥] 円[￥]",
+    "売買高加重", "平均価格", "VWAP", "円[￥]",
+}
+DATE_PAGE_RE = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日')
+COPYRIGHT_RE = re.compile(r'^Copyright \(c\) Tokyo Stock Exchange')
+
+# 「市場」列に転記する対象(和文見出しそのまま)
+MARKET_HEADERS = {"プライム市場", "スタンダード市場", "グロース市場"}
+# 内容としては情報を持つが、業種欄には転記したくない行(英語版の市場見出し等)
+NON_INDUSTRY_OTHER_LINES = {
+    "Prime Market", "Standard Market", "Growth Market",
+    "内国株式", "Domestic Stock", "外国株式", "Foreign Stock",
+    "Ｒ Ｅ Ｉ Ｔ", "REIT",
+}
+
+
+def is_junk(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if s in HEADER_JUNK_EXACT:
+        return True
+    if DATE_PAGE_RE.match(s):
+        return True
+    if COPYRIGHT_RE.match(s):
+        return True
+    return False
+
+
+def parse_text(text: str) -> list[dict]:
+    """
+    PDFから抽出したテキストを解析し、銘柄ごとのレコード(dict)のリストを返す。
+    各レコードには code/name_jp/name_en に加え、直前に出現したセクション見出しから
+    推定した industry(業種) / market(市場) を付与する。
+    """
+    lines = text.splitlines()
+    content = [l for l in lines if not is_junk(l)]
+
+    current_market = None
+    current_industry = None
+    pending_code = None
+    pending_name_jp = None
+    pending_name_en = None
+
+    records = []
+    skipped_data_lines = 0
+
+    for raw in content:
+        s = raw.strip()
+
+        dm = DATA_LINE_RE.match(s)
+        if dm:
+            if pending_code is not None and pending_name_en is not None:
+                rec = dm.groupdict()
+                rec["code"] = pending_code
+                rec["name_jp"] = pending_name_jp
+                rec["name_en"] = pending_name_en
+                rec["industry"] = current_industry
+                rec["market"] = current_market
+                records.append(rec)
+            else:
+                skipped_data_lines += 1
+            pending_code = pending_name_jp = pending_name_en = None
+            continue
+
+        cm = CODE_NAME_RE.match(s)
+        if cm and pending_code is None:
+            pending_code = cm.group("code")
+            pending_name_jp = cm.group("name_jp")
+            continue
+
+        if pending_code is not None and pending_name_en is None:
+            # コード行の直後に来る英語銘柄名の行
+            pending_name_en = s
+            continue
+
+        # ここに来るのは「業種見出し」または「市場見出し」等のセクション行
+        if s in MARKET_HEADERS:
+            current_market = s.replace("市場", "")
+        elif s in NON_INDUSTRY_OTHER_LINES:
+            pass  # 市場の英語表記など、業種欄には転記しない
+        else:
+            current_industry = s
+
+    if skipped_data_lines:
+        print(f"[WARN] コード名を特定できず読み飛ばしたデータ行: {skipped_data_lines}件"
+              " (会社名が複数行に折り返された等の理由が考えられます)", file=sys.stderr)
+    return records
+
+
+# ------------------------------------------------------------------
+# 4. Google スプレッドシートへの書き込み(ワイド形式: 銘柄=行, 日付=列)
+# ------------------------------------------------------------------
+
+# 対象スプレッドシートID (URLの /d/ と /edit の間の文字列)
+# 環境変数 SPREADSHEET_ID が設定されていればそちらを優先する(別スプレッドシートに切り替えたい場合用)
+SPREADSHEET_ID_DEFAULT = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
+
+# 各項目シートのgid (URLの gid= の値)
+SHEET_SPECS = [
+    # (表示名, gid, レコードのキー)
+    ("前場始値", 383067295, "am_open"),
+    ("前場高値", 2103325248, "am_high"),
+    ("前場安値", 820854515, "am_low"),
+    ("前場終値", 599538789, "am_close"),
+    ("後場始値", 266318248, "pm_open"),
+    ("後場高値", 1004322238, "pm_high"),
+    ("後場安値", 146259449, "pm_low"),
+    ("後場終値", 1352449304, "pm_close"),
+    ("VWAP", 519095635, "vwap"),
+    ("出来高", 941877137, "volume"),
+]
+HEADER_ROW = ["コード", "銘柄名", "業種", "市場"]
+DATA_START_COL = 5  # E列(1-indexed)
+
+
+def get_gspread_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not creds_json:
+        raise RuntimeError("環境変数 GOOGLE_SERVICE_ACCOUNT_JSON が設定されていません。")
+    info = json.loads(creds_json)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def col_letter(n: int) -> str:
+    """1-indexed列番号をA1表記の列文字に変換 (5 -> 'E')。"""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, force: bool = False):
+    """
+    1つの項目シート(ワイド形式)を更新する。
+    - A=コード, B=銘柄名, C=業種, D=市場 は既存行がある場合は変更しない
+    - 新しい日付は E列に挿入し、既存の日付列は右にずれる
+    - 該当銘柄の当日データが無い場合は空欄
+    - 未登録の銘柄(新規コード)は最終行に新しい行として追加
+    """
+    all_values = ws.get_all_values()
+
+    if not all_values:
+        ws.update("A1:D1", [HEADER_ROW])
+        all_values = [HEADER_ROW]
+
+    header = all_values[0]
+    data_rows = all_values[1:]
+
+    # 既に同じ日付列が存在する場合は二重挿入を避ける
+    if not force and date_str in header:
+        print(f"  [SKIP] 既に {date_str} 列が存在するため挿入をスキップします(--force で強制上書き可)")
+        return
+
+    code_to_rowidx = {}
+    for idx, row in enumerate(data_rows):
+        if row and row[0]:
+            code_to_rowidx[row[0]] = idx
+
+    records_by_code = {r["code"]: r for r in records}
+    n_existing_rows = len(data_rows)
+
+    # 新しい列(E列)に入れる値: ヘッダー(日付) + 既存行それぞれの値(無ければ空欄)
+    col_values = [date_str]
+    for row in data_rows:
+        code = row[0] if row else ""
+        rec = records_by_code.get(code)
+        col_values.append(rec[metric_key] if rec else "")
+
+    # Step1: E列の前に空列を1つ挿入(既存の日付列は右にずれる)
+    ws.spreadsheet.batch_update({
+        "requests": [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "COLUMNS",
+                    "startIndex": DATA_START_COL - 1,
+                    "endIndex": DATA_START_COL,
+                },
+                "inheritFromBefore": False,
+            }
+        }]
+    })
+
+    # Step2: 挿入した列(E列)に日付+各行の値をまとめて書き込み
+    end_row = 1 + n_existing_rows
+    col = col_letter(DATA_START_COL)
+    ws.update(f"{col}1:{col}{end_row}", [[v] for v in col_values],
+              value_input_option="USER_ENTERED")
+
+    # Step3: 既存シートに無い新規銘柄は末尾に新しい行として追加
+    new_rows = []
+    for r in records:
+        if r["code"] not in code_to_rowidx:
+            new_rows.append([
+                r["code"], r["name_jp"], r["industry"] or "", r["market"] or "",
+                r[metric_key],
+            ])
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+
+    print(f"  [OK] 既存{n_existing_rows}行を更新 / 新規{len(new_rows)}行を追加")
+
+
+LOG_SHEET_TITLE = "_ProcessedDates"
+
+
+def mark_processed(spreadsheet, date_str: str, n_records: int):
+    try:
+        log_ws = spreadsheet.worksheet(LOG_SHEET_TITLE)
+    except Exception:
+        log_ws = spreadsheet.add_worksheet(title=LOG_SHEET_TITLE, rows="1000", cols="3")
+        log_ws.update("A1:C1", [["日付", "件数", "実行日時"]])
+    log_ws.append_row([date_str, n_records, datetime.now().isoformat(timespec="seconds")],
+                       value_input_option="USER_ENTERED")
+
+
+def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = False, force: bool = False):
+    date_str = target_date.strftime("%Y-%m-%d")
+
+    if dry_run:
+        print(f"[DRY-RUN] {date_str} 分、{len(records)}銘柄を各シートのE列に挿入する予定です"
+              "(実際には書き込みません)。")
+        sample = records[0]
+        for name, _gid, key in SHEET_SPECS:
+            print(f"  - {name}: 例 {sample['code']} {sample['name_jp']} "
+                  f"(業種:{sample['industry']} / 市場:{sample['market']}) = {sample[key]}")
+        return
+
+    gc = get_gspread_client()
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", SPREADSHEET_ID_DEFAULT)
+    sh = gc.open_by_key(spreadsheet_id)
+
+    for name, gid, key in SHEET_SPECS:
+        print(f"[{name}] 更新中...")
+        ws = sh.get_worksheet_by_id(gid)
+        if ws is None:
+            print(f"  [ERROR] gid={gid} のシートが見つかりません。スキップします。", file=sys.stderr)
+            continue
+        update_wide_sheet(ws, date_str, records, key, force=force)
+        time.sleep(1)  # API レート制限対策
+
+    mark_processed(sh, date_str, len(records))
+
+
+# ------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="JPX 東京証券取引所日報 株式相場表 取得スクリプト")
+    parser.add_argument("--date", type=str, default=None,
+                         help="取得したい日付 (YYYY-MM-DD)。省略時は最新日を自動検出。")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="スプレッドシートへの書き込みを行わず、解析結果件数のみ表示する。")
+    parser.add_argument("--force", action="store_true",
+                         help="同日データが処理済みでも強制的に再書き込みする。")
+    args = parser.parse_args()
+
+    target_date = None
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+
+    print("[STEP1] JPXサイトからPDFリンクを検索中...")
+    pdf_url, resolved_date = find_pdf_url(target_date)
+    print(f"  -> {resolved_date} : {pdf_url}")
+
+    print("[STEP2] PDFをダウンロード中...")
+    pdf_bytes = download_pdf(pdf_url)
+    print(f"  -> {len(pdf_bytes):,} bytes")
+
+    print("[STEP3] PDFからテキストを抽出中...")
+    text = extract_text_from_pdf(pdf_bytes)
+
+    print("[STEP4] テキストを解析中...")
+    records = parse_text(text)
+    print(f"  -> {len(records)} 銘柄を抽出しました")
+
+    if not records:
+        print("[ERROR] 1件も解析できませんでした。PDFフォーマットが変更された可能性があります。", file=sys.stderr)
+        sys.exit(1)
+
+    print("[STEP5] Google スプレッドシートへ書き込み中...")
+    write_to_sheets(records, resolved_date, dry_run=args.dry_run, force=args.force)
+
+    print("完了しました。")
+
+
+if __name__ == "__main__":
+    main()
