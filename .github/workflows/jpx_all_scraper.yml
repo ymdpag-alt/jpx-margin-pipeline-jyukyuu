@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 7 * * 1-5"   # 平日 16:00 JST (07:00 UTC)
   workflow_dispatch:
+    inputs:
+      target_date:
+        description: "対象日 YYYYMMDD（空欄なら最新日を自動取得）"
+        required: false
+        default: ""
 
 concurrency:
   group: jpx-scrape
@@ -13,7 +18,7 @@ jobs:
   scrape:
     name: JPX データ取得 & スプシ書き込み
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -27,10 +32,14 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r scripts/requirements.txt
-          pip install "beautifulsoup4>=4.12.0"
+          pip install "beautifulsoup4>=4.12.0" "playwright>=1.40.0"
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
 
       - name: JPX スクレイプ実行
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           TZ: Asia/Tokyo
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: python scripts/JPX/scrape_jpx_all.py
