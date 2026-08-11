@@ -33,9 +33,22 @@ OWN_SHARES_URL = "https://www.jpx.co.jp/markets/equities/off-auction-ownshares/i
 SECTOR_URL     = "https://www.jpx.co.jp/markets/indices/realvalues/"
 JPX_BASE       = "https://www.jpx.co.jp"
 
-SECTOR_ROWS   = {"current": 1, "low": 40, "high": 80, "open": 120}
 SECTOR_LABELS = {"current": "現在値", "low": "安値", "high": "高値", "open": "始値"}
-SECTOR_MARKER = "A35"
+SECTOR_BLOCK_ORDER = ["current", "low", "high", "open"]
+SECTOR_GAP = 3   # ブロック間の空白行数
+
+def _compute_sector_rows(n_sectors: int) -> dict:
+    """
+    各ブロックの開始行を動的に計算する。
+    ブロック構成: 1行目=取得日(C列)、2〜n+1行目=データ(A列名/C列値)
+    ブロック間は SECTOR_GAP 行だけ空ける。
+    """
+    block_size = 1 + n_sectors   # 日付行 + データ行
+    step = block_size + SECTOR_GAP
+    return {name: 1 + i * step for i, name in enumerate(SECTOR_BLOCK_ORDER)}
+
+# マーカーは 1 番目のブロック(現在値)の C1（取得日）を流用
+SECTOR_MARKER = "C1"
 
 # 業種別指数ページの実測列順（Playwright レンダリング後）:
 #   0=指数名 1=現在値 2=前日比(値) 3=前日比(%) 4=始値 5=高値 6=安値
@@ -158,13 +171,26 @@ def fetch(url):
 #  リンク先は xlsx。ヘッダー行を検出して動的に列マッピングする。
 #  出力列: 公表日 | 取引日 | コード | 銘柄 | 価格 | 売買高 | 売買代金
 # ═════════════════════════════════════════════════════════════
+# 実際の xlsx ヘッダー（1行目）:
+#   公表日/Publication_Date, 取引日/Trading_Date, 約定時刻/Trade_Time,
+#   銘柄コード/Code, 銘柄名_日本語/Issue_Name_Japanese, 銘柄名_英語/Issue_Name_English,
+#   価格_円/Price_yen, 売買高_株/Trading_Volume_shares, 売買代金_円/Trading_Value_yen
 _TOSTNET_HDR_KEYS = {
-    "code":   ["コード"],
-    "name":   ["銘柄", "会社名"],
-    "date":   ["取引日", "約定日", "売買日"],
-    "price":  ["価格", "値段", "約定値段"],
-    "volume": ["出来高", "売買高", "数量"],
-    "value":  ["代金", "売買代金"],
+    "kouhyo":  ["公表日", "Publication_Date"],
+    "date":    ["取引日", "Trading_Date"],
+    "code":    ["銘柄コード", "Code"],
+    "name":    ["銘柄名_日本語", "Issue_Name_Japanese"],
+    "price":   ["価格", "Price"],
+    "volume":  ["売買高", "Trading_Volume"],
+    "value":   ["売買代金", "Trading_Value"],
+}
+
+# 実測ヘッダー順（0-indexed）のフォールバック位置:
+#   0=公表日 1=取引日 2=約定時刻 3=銘柄コード 4=銘柄名_日本語
+#   5=銘柄名_英語 6=価格_円 7=売買高_株 8=売買代金_円
+_TOSTNET_FALLBACK_COLS = {
+    "kouhyo": 0, "date": 1, "code": 3, "name": 4,
+    "price": 6, "volume": 7, "value": 8,
 }
 
 
@@ -176,7 +202,8 @@ def _detect_xlsx_header(rows):
     for i, row in enumerate(rows[:15]):
         cells = ["" if c is None else str(c).strip() for c in row]
         joined = "".join(cells)
-        if "コード" in joined and ("価格" in joined or "値段" in joined):
+        if ("銘柄コード" in joined or "Code" in joined) and \
+           ("価格" in joined or "Price" in joined):
             col = {}
             for j, c in enumerate(cells):
                 for key, keywords in _TOSTNET_HDR_KEYS.items():
@@ -205,11 +232,16 @@ def _parse_tostnet_xlsx(url, kouhyo_date):
         header_idx, col = _detect_xlsx_header(rows)
 
         if header_idx is None:
-            log.info("  [xlsx] ヘッダー未検出 → 先頭6行をダンプ")
+            log.info("  [xlsx] ヘッダー未検出 → 先頭6行をダンプ、固定位置で継続")
             for j, row in enumerate(rows[:6]):
                 cells = ["" if c is None else str(c) for c in row]
                 log.info("    row[%d]: %s", j, [c[:20] for c in cells])
-            continue
+            header_idx = 0
+            col = dict(_TOSTNET_FALLBACK_COLS)
+
+        # 検出できなかったキーは既知の固定位置で補完
+        for k, v in _TOSTNET_FALLBACK_COLS.items():
+            col.setdefault(k, v)
 
         log.info("  [xlsx] ヘッダー行=%d 列マップ=%s", header_idx, col)
 
@@ -227,15 +259,25 @@ def _parse_tostnet_xlsx(url, kouhyo_date):
                 idx = col.get(key)
                 if idx is None or idx >= len(cells):
                     return default
-                return cells[idx]
+                v = cells[idx]
+                return v
 
+            def g_num(key, default=""):
+                """数値セル用: openpyxl が float(1234.0) を返すケースを整形"""
+                v = g(key, default)
+                if re.fullmatch(r"-?\d+\.0", v):
+                    v = v[:-2]
+                return v
+
+            # 公表日はシート内の値を優先、無ければ引数の kouhyo_date を使用
+            kouhyo = g("kouhyo", kouhyo_date) or kouhyo_date
             torihiki = g("date")
             name     = g("name")
-            price    = g("price")
-            volume   = g("volume")
-            value    = g("value")
+            price    = g_num("price")
+            volume   = g_num("volume")
+            value    = g_num("value")
 
-            out.append([kouhyo_date, torihiki, code, name, price, volume, value])
+            out.append([kouhyo, torihiki, code, name, price, volume, value])
 
     return out
 
@@ -486,18 +528,29 @@ def scrape_sector():
     return data
 
 
-def write_sector_block(ws, data, metric, start_row):
+def write_sector_block(ws, data, metric, start_row, fetch_date):
+    """
+    start_row     : 取得日を書く行（C列）
+    start_row + 1 〜 start_row + n : 業種名(A列) と 値(C列)
+    """
     n = len(data)
     if n == 0:
         return
+
+    # 1行目: 取得日 (C列)
+    ws.update(values=[[fetch_date]], range_name=f"C{start_row}",
+              value_input_option="USER_ENTERED")
+
+    # 2行目〜: 業種名(A) と 値(C)
+    data_start = start_row + 1
     ws.update(values=[[d["name"]] for d in data],
-              range_name=f"A{start_row}:A{start_row+n-1}",
+              range_name=f"A{data_start}:A{data_start+n-1}",
               value_input_option="USER_ENTERED")
     ws.update(values=[[d[metric]] for d in data],
-              range_name=f"C{start_row}:C{start_row+n-1}",
+              range_name=f"C{data_start}:C{data_start+n-1}",
               value_input_option="USER_ENTERED")
-    log.info("    ✓ %s: row%d〜%d (%d件)",
-             SECTOR_LABELS[metric], start_row, start_row+n-1, n)
+    log.info("    ✓ %s: 日付行=%d データ行%d〜%d (%d件)",
+             SECTOR_LABELS[metric], start_row, data_start, data_start+n-1, n)
     time.sleep(1.2)
 
 
@@ -510,19 +563,23 @@ def run_sector(ss):
         return
 
     ws = get_ws(ss, GID_SECTOR)
+    now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
     today = datetime.now(JST).strftime("%Y/%m/%d")
+
+    # 重複チェック: C1（現在値ブロックの取得日）の日付部分を比較
     marker = (ws.acell(SECTOR_MARKER).value or "").strip()
-    if marker == today:
+    if marker[:10] == today:
         log.info("  既挿入済み (%s) → スキップ", today)
         return
 
     insert_col_c(ss, ws)
     time.sleep(1.5)
-    for metric, start_row in SECTOR_ROWS.items():
-        write_sector_block(ws, data, metric, start_row)
-    ws.update(values=[[today]], range_name=SECTOR_MARKER,
-              value_input_option="USER_ENTERED")
-    log.info("  ✓ マーカー更新: %s ← %s", SECTOR_MARKER, today)
+
+    sector_rows = _compute_sector_rows(len(data))
+    for metric, start_row in sector_rows.items():
+        write_sector_block(ws, data, metric, start_row, now_str)
+
+    log.info("  ✓ 全ブロック書き込み完了 (取得日時: %s)", now_str)
 
 
 # ═════════════════════════════════════════════════════════════
