@@ -7,10 +7,15 @@ on:
     - cron: "30 9 * * 1-5"
   workflow_dispatch:
     inputs:
-      target_date:
+      date:
         description: "取得する公表日 (YYYY-MM-DD)。空欄なら最新"
         required: false
         default: ""
+      force:
+        description: "既存の日付列があっても上書きする"
+        type: boolean
+        required: false
+        default: false
       dry_run:
         description: "書き込まずに動作確認する"
         type: boolean
@@ -28,12 +33,6 @@ jobs:
 
     env:
       TZ: Asia/Tokyo
-      SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID || '1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY' }}
-      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-      TARGET_DATE: ${{ github.event.inputs.target_date }}
-      DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
-      RATIO_AS_PERCENT: "1"
-      MAX_DATE_COLS: "300"
       PYTHONUTF8: "1"
 
     steps:
@@ -48,9 +47,27 @@ jobs:
           cache-dependency-path: "scripts/空売り/requirements.txt"
 
       - name: Install dependencies
+        working-directory: scripts/空売り
         run: |
           python -m pip install --upgrade pip
-          pip install -r "scripts/空売り/requirements.txt"
+          pip install -r requirements.txt
 
-      - name: Run scraper
-        run: python "scripts/空売り/jpx_short_selling.py"
+      - name: JPX空売り残高を取得してスプレッドシートに書き込み
+        working-directory: scripts/空売り
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}  # 未設定でもOK(スクリプト内デフォルトを使用)
+          RATIO_AS_PERCENT: "1"
+          MAX_DATE_COLS: "300"
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python "jpx_short_selling.py" $ARGS
