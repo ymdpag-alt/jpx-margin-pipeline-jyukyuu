@@ -27,6 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # 最小権限（このジョブはリポジトリへ書き込まない）
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,23 +46,27 @@ jobs:
 
       - name: Run fetch script
         env:
-          # 全 Secret をまとめて渡す（Secret名に依存せず自動検出するため）
-          ALL_SECRETS: ${{ toJSON(secrets) }}
+          # 必要な Secret のみを明示的に渡す
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # ユーザー入力は環境変数経由で渡す（シェルへの直接展開を避ける）
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          CMD="python scripts/品貸料/fetch_hinkatsu.py"
+          set -euo pipefail
+
+          ARGS=()
 
           # 日付指定（手動実行時のみ）
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            CMD="$CMD --date ${{ github.event.inputs.date }}"
+          if [ -n "${INPUT_DATE:-}" ]; then
+            ARGS+=(--date "$INPUT_DATE")
           fi
 
           # DRY-RUN オプション
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            CMD="$CMD --dry-run"
+          if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then
+            ARGS+=(--dry-run)
           fi
 
-          echo "実行コマンド: $CMD"
-          $CMD
+          python scripts/品貸料/fetch_hinkatsu.py "${ARGS[@]}"
 
       - name: Notify on failure
         if: failure()
