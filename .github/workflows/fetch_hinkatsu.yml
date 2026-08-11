@@ -46,8 +46,10 @@ jobs:
 
       - name: Run fetch script
         env:
-          # 必要な Secret のみを明示的に渡す
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # 既存ワークフロー（Jpx daily.yml 等）と同じ Secret を使用
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # 未設定でもOK（スクリプト内のデフォルトIDを使用）
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           # ユーザー入力は環境変数経由で渡す（シェルへの直接展開を避ける）
           INPUT_DATE: ${{ inputs.date }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
