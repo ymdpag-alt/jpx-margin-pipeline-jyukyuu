@@ -38,13 +38,13 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r scripts/品貸料/requirements.txt
 
       - name: Run fetch script
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: |
-          CMD="python scripts/fetch_hinkatsu.py"
+          CMD="python scripts/品貸料/fetch_hinkatsu.py"
 
           # 日付指定（手動実行時のみ）
           if [ -n "${{ github.event.inputs.date }}" ]; then
