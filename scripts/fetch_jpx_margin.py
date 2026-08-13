@@ -38,6 +38,12 @@ extract_text()で取った行を正規表現でパースする方式にしてい
     日付ラベルは各データ本来の金曜日付を使うため、シート間で列位置は1週ずれるが
     ラベルを見れば対応関係は一意に判別できる。
   制度貸借取引は対象外の統計であり、JPXの信用残とは別系統のデータである点に注意。
+
+■ gspread 6.x 対応について（2026/8 修正）
+  gspread 5.x では Spreadsheet.client が gspread.Client を返していたが、
+  gspread 6.x では http_client.HTTPClient を返すようになり open_by_key() を持たない。
+  そのため「ws から Client を取り出してシートを取り直す」実装は AttributeError になる。
+  行数・列数の拡張は既に手元にある Worksheet オブジェクトに対して直接行う。
 """
 
 from __future__ import annotations
@@ -413,7 +419,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
 
 
 # =============================================================================
-# 貸株残（日本証券業協会）取得・パース  ★追加セクション★
+# 貸株残（日本証券業協会）取得・パース
 # =============================================================================
 
 def _jsda_session() -> requests.Session:
@@ -585,16 +591,31 @@ def authenticate_google_sheets() -> gspread.Client:
     return gspread.authorize(creds)
 
 
+def _ensure_worksheet_size(ws: gspread.Worksheet, min_cols: int = 0, min_rows: int = 0) -> None:
+    """
+    ワークシートの列数・行数が足りなければ拡張する。
+
+    [gspread 6.x 対応] add_cols() / add_rows() は内部で resize() を呼び、
+    ローカルの _properties も更新するため、拡張後にシートを取り直す必要はない。
+    取り直すには Client が必要だが、Worksheet からは Client を辿れない
+    （ws.spreadsheet.client は 6.x では HTTPClient）ため、この方式に統一する。
+    """
+    if min_cols and ws.col_count < min_cols:
+        ws.add_cols(min_cols - ws.col_count)
+    if min_rows and ws.row_count < min_rows:
+        ws.add_rows(min_rows - ws.row_count)
+
+
 def get_or_create_worksheet(
     gc: gspread.Client,
     sheet_name: str,
     min_cols: int = 50,
     min_rows: int = 100,
     spreadsheet_id: str | None = None,
-):
+) -> gspread.Worksheet:
     """
-    [変更点] spreadsheet_id を引数で受け取れるようにした。
-    省略時は従来どおり SPREADSHEET_ID（信用残のブック）を使う。
+    シートを取得し、無ければ作成する。
+    spreadsheet_id を省略した場合は SPREADSHEET_ID（信用残のブック）を使う。
     """
     spreadsheet = gc.open_by_key(spreadsheet_id or SPREADSHEET_ID)
     try:
@@ -602,12 +623,7 @@ def get_or_create_worksheet(
     except gspread.exceptions.WorksheetNotFound:
         print(f"  シート '{sheet_name}' を新規作成します")
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=max(min_rows, 100), cols=min_cols)
-    if ws.col_count < min_cols:
-        ws.add_cols(min_cols - ws.col_count)
-        ws = spreadsheet.worksheet(sheet_name)
-    if ws.row_count < min_rows:
-        ws.add_rows(min_rows - ws.row_count)
-        ws = spreadsheet.worksheet(sheet_name)
+    _ensure_worksheet_size(ws, min_cols=min_cols, min_rows=min_rows)
     return ws
 
 
@@ -629,6 +645,7 @@ def _write_first_time(ws: gspread.Worksheet, df: pd.DataFrame, value_col: str, j
     print(f"  [{sheet_name}] 初回書き込み")
     header = ["銘柄コード", "銘柄名", jp_date]
     rows = [[row["銘柄コード"], row["銘柄名"], row[value_col]] for _, row in df.iterrows()]
+    _ensure_worksheet_size(ws, min_cols=FIXED_COLS + 1, min_rows=len(rows) + 1)
     ws.update(values=[header] + _native_rows(rows), range_name="A1", value_input_option="USER_ENTERED")
 
 
@@ -687,14 +704,11 @@ def _append_new_stocks(
     start_row = existing_row_count + 1
     end_row = start_row + len(new_rows) - 1
 
-    # [変更点] 書き込み先ブックを取り違えないよう、対象ワークシート自身のIDを使う
-    ws = get_or_create_worksheet(
-        gc=ws.spreadsheet.client,
-        sheet_name=sheet_name,
-        min_cols=total_cols,
-        min_rows=end_row,
-        spreadsheet_id=ws.spreadsheet.id,
-    )
+    # [gspread 6.x 対応] Client を経由してシートを取り直すのではなく、
+    # 既に手元にある Worksheet をそのまま拡張する。
+    # 同一オブジェクトを使い続けるため、書き込み先ブックの取り違えも構造的に起こらない。
+    _ensure_worksheet_size(ws, min_cols=total_cols, min_rows=end_row)
+
     end_a1 = gspread.utils.rowcol_to_a1(end_row, total_cols)
     ws.update(values=new_rows, range_name=f"A{start_row}:{end_a1}", value_input_option="USER_ENTERED")
 
@@ -716,7 +730,7 @@ def update_spreadsheet_single_column(
       既存銘柄は該当行のC列を更新、新規銘柄はシート末尾に行を追加する。
     - 同じ日付が既にどこかの列にあればスキップ（二重書き込み防止）
 
-    [変更点] spreadsheet_id を引数で受け取れるようにした（貸株残は別ブックのため）。
+    spreadsheet_id を省略した場合は SPREADSHEET_ID（信用残のブック）を使う。
     """
     ws = get_or_create_worksheet(gc, sheet_name, spreadsheet_id=spreadsheet_id)
     existing = ws.get_all_values()
@@ -726,9 +740,6 @@ def update_spreadsheet_single_column(
     jp_date = to_japanese_date(date_yyyymmdd)
 
     if not has_header:
-        ws = get_or_create_worksheet(
-            gc, sheet_name, min_cols=FIXED_COLS + 1, spreadsheet_id=spreadsheet_id
-        )
         _write_first_time(ws, df, value_col, jp_date, sheet_name)
         return
 
@@ -756,7 +767,7 @@ def update_spreadsheet_single_column(
 
 
 # =============================================================================
-# 貸株残の更新処理  ★追加セクション★
+# 貸株残の更新処理
 # =============================================================================
 
 def _existing_jsda_dates(gc: gspread.Client) -> set[str]:
