@@ -1,0 +1,64 @@
+name: JPX信用取引規制データ取得
+
+on:
+  schedule:
+    # 平日 16:00 JST (07:00 UTC) に実行。JPXの当該ページは取引終了後に更新されるため。
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "新規記載日(A列)として使う日付 YYYY-MM-DD（空欄なら実行日/JST）"
+        required: false
+        default: ""
+      force:
+        description: "非営業日でも強制実行する"
+        required: false
+        default: false
+        type: boolean
+      only:
+        description: "実行対象"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - reg
+          - daily
+
+concurrency:
+  group: jpx-margin-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存パッケージをインストール
+        working-directory: scripts/信用規制
+        run: pip install -r requirements.txt
+
+      - name: JPX信用取引規制データを取得してスプレッドシートに書き込み
+        working-directory: scripts/空売り
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}  # 未設定でもOK(スクリプト内デフォルトを使用)
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          if [ -n "${{ github.event.inputs.only }}" ]; then
+            ARGS="$ARGS --only ${{ github.event.inputs.only }}"
+          fi
+          python jpx_margin_scraper.py $ARGS
