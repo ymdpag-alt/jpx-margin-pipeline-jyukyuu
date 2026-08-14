@@ -2,7 +2,7 @@ name: JPX 一括スクレイプ
 
 on:
   schedule:
-    - cron: "0 7 * * 1-5"   # 平日 16:00 JST (07:00 UTC)
+    - cron: "50 7 * * 1-5"   # 平日 16:00 JST (07:00 UTC)
   workflow_dispatch:
     inputs:
       target_date:
