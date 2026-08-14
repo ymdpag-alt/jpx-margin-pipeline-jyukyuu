@@ -25,10 +25,11 @@ JPX 信用取引規制データ 一括取得スクリプト
     - 「解除された銘柄」一覧は、コードが一致しE列が空欄の行を探して解除日を記入
     - 対応する未解除行が見つからない場合は、情報を失わないよう新規行として追加
 
-ページ取得について:
-    JPXの両ページは本文（テーブル）をJavaScriptで描画しているため、
-    requestsによる静的HTML取得では取得できない。Playwright(Chromium)で
-    レンダリング後のHTMLを取得してから解析する。
+HTML解析の注意点:
+    JPXのテーブルはヘッダー行を <th> ではなく <td> で組んでいるため、
+    pandas.read_html が列名を 0,1,2... と振り、ヘッダーが本文1行目に
+    入った状態で返ってくる。_match_table() でヘッダー行を検出して
+    列名に昇格させることで、<td>・<th> どちらの構成でも解析できるようにしている。
 
 日付の扱い:
     JPXのページは常に「最新の状態」のスナップショットであり、過去日を指定して
@@ -61,11 +62,12 @@ from typing import Dict, List, Optional
 
 import gspread
 import jpholiday
+import numpy as np
 import pandas as pd
+import requests
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import TimeoutError as PWTimeoutError
-from playwright.sync_api import sync_playwright
 from zoneinfo import ZoneInfo
+
 
 # =============================================================================
 # 共通設定
@@ -87,12 +89,13 @@ SPREADSHEET_ID = _env_str("SPREADSHEET_ID", "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRRE
 MARGIN_REG_GID = _env_int("MARGIN_REG_GID", 1552537213)
 MARGIN_DAILY_GID = _env_int("MARGIN_DAILY_GID", 173915474)
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-PAGE_LOAD_TIMEOUT_MS = 45000
-TABLE_WAIT_TIMEOUT_MS = 20000
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
 
 SHEET_HEADER = ["新規記載日", "コード", "銘柄名", "実施日", "解除日", "規制の内容", "該当基準"]
 
@@ -135,44 +138,121 @@ def is_business_day(dt: datetime) -> bool:
 
 
 # =============================================================================
-# ページ取得（Playwrightでレンダリング後のHTMLを取得）
+# ページ取得
 # =============================================================================
-def render_page_html(page, url: str) -> str:
+def fetch_html(url: str) -> str:
     print(f"取得中: {url}")
-    page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-    try:
-        page.wait_for_selector("table", timeout=TABLE_WAIT_TIMEOUT_MS)
-    except PWTimeoutError:
-        print(f"  ※ table要素の出現待機がタイムアウトしました。取得できた時点のHTMLで解析を試みます。")
-    return page.content()
+    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding
+    return resp.text
 
 
 # =============================================================================
 # HTML解析 共通ユーティリティ
 # =============================================================================
+def _to_text(v) -> str:
+    """セル値を安全に文字列化する。
+
+    ヘッダーが<th>で組まれている場合、コード列が数値型として読み込まれ、
+    そのまま str() すると '3907.0' のようになってシート側の文字列と
+    一致しなくなる。float表現の末尾 .0 を除去して防ぐ。
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if np.isnan(v):
+            return ""
+        if v.is_integer():
+            return str(int(v))
+        return str(v)
+    return str(v).strip()
+
+
 def _flatten_columns(columns) -> List[str]:
     """pandas.read_htmlがMultiIndex列を返した場合でも単純な文字列リストに正規化する"""
     flat = []
     for c in columns:
         if isinstance(c, tuple):
-            parts = [str(x).strip() for x in c if str(x).strip() and not str(x).startswith("Unnamed")]
+            parts = [
+                str(x).strip()
+                for x in c
+                if str(x).strip() and not str(x).startswith("Unnamed")
+            ]
             flat.append("".join(parts) if parts else str(c[-1]).strip())
         else:
             flat.append(str(c).strip())
     return flat
 
 
-def _debug_dump_tables(label: str, tables) -> None:
-    print(f"[{label}] 取得できたtable数: {len(tables)}")
-    for i, t in enumerate(tables):
-        print(f"  table[{i}] shape={t.shape} columns={_flatten_columns(t.columns)}")
+def _match_table(df: pd.DataFrame, required: List[str]) -> Optional[pd.DataFrame]:
+    """required の列を全て含むテーブルなら、列名を正規化して返す。含まなければ None。
+
+    JPXのテーブルはヘッダーを <th> ではなく <td> で組んでいるため、
+    pandas が列名を 0,1,2... と振り、ヘッダーが本文1行目に入った状態で
+    返ってくることがある。その場合はヘッダー行を検出して列名に昇格させる。
+    """
+    # ケース1: pandasがヘッダーを正しく認識している（<th>構成）
+    cols = _flatten_columns(df.columns)
+    if all(c in cols for c in required):
+        out = df.copy()
+        out.columns = cols
+        out = out.loc[:, ~pd.Index(cols).duplicated()]
+        return out[required].copy().reset_index(drop=True)
+
+    # ケース2: ヘッダーが本文の先頭行に入っている（<td>構成）
+    for i in range(min(3, len(df))):
+        row = [_to_text(v) for v in df.iloc[i].tolist()]
+        if all(c in row for c in required):
+            out = df.iloc[i + 1:].copy()
+            out.columns = row
+            out = out.loc[:, ~pd.Index(row).duplicated()]
+            return out[required].copy().reset_index(drop=True)
+
+    return None
+
+
+def _find_tables(html: str, label: str, specs: Dict[str, List[str]]) -> Dict[str, pd.DataFrame]:
+    """HTML内の全テーブルから、specsで指定した列構成に合致するものを探す。
+
+    specs: {"regulated": [必要な列...], "released": [必要な列...]} の形式。
+    同じテーブルが複数のspecに重複マッチしないよう、一度使ったテーブルは除外する。
+    """
+    tables = pd.read_html(StringIO(html), flavor="lxml")
+    found: Dict[str, pd.DataFrame] = {}
+    used = set()
+
+    for key, required in specs.items():
+        for idx, t in enumerate(tables):
+            if idx in used:
+                continue
+            matched = _match_table(t, required)
+            if matched is not None:
+                found[key] = matched
+                used.add(idx)
+                break
+
+    missing = [k for k in specs if k not in found]
+    if missing:
+        # 失敗時に原因を追いやすいよう、取得できたテーブルの概要を出力する
+        print(f"[{label}] 取得できたtable数: {len(tables)}")
+        for i, t in enumerate(tables):
+            print(f"  table[{i}] shape={t.shape} columns={_flatten_columns(t.columns)}")
+            if len(t) > 0:
+                print(f"    1行目: {[_to_text(v) for v in t.iloc[0].tolist()]}")
+        raise RuntimeError(
+            f"{label}: 必要なテーブル {missing} が見つかりません。"
+            "JPXのページ構成が変更された可能性があります。"
+        )
+    return found
 
 
 def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """全セルを文字列化し、コード列が空のダミー行を除去する"""
     for col in df.columns:
-        df[col] = df[col].astype(str).str.strip()
-    df.drop(df[df["コード"].isin(["nan", "", "－", "-"])].index, inplace=True)
-    return df
+        df[col] = df[col].map(_to_text)
+    df = df[~df["コード"].isin(["", "nan", "－", "-", "―"])]
+    return df.reset_index(drop=True)
 
 
 # =============================================================================
@@ -208,13 +288,13 @@ def load_existing(ws) -> List[Dict]:
         rows.append(
             {
                 "sheet_row": i,
-                "new_date": row[0],
-                "code": row[1],
-                "name": row[2],
-                "start_date": row[3],
-                "end_date": row[4],
-                "content": row[5],
-                "criteria": row[6],
+                "new_date": row[0].strip(),
+                "code": row[1].strip(),
+                "name": row[2].strip(),
+                "start_date": row[3].strip(),
+                "end_date": row[4].strip(),
+                "content": row[5].strip(),
+                "criteria": row[6].strip(),
             }
         )
     return rows
@@ -245,7 +325,9 @@ def process_new_entries(ws, records: List[NewRecord], record_date: str, label: s
         print(f"[{label}] 新規データなし（更新済み）")
 
 
-def process_released_entries(ws, records: List[ReleasedRecord], record_date: str, label: str) -> None:
+def process_released_entries(
+    ws, records: List[ReleasedRecord], record_date: str, label: str
+) -> None:
     """コードが一致しE列(解除日)が空欄の行に解除日を記入する"""
     existing = load_existing(ws)
 
@@ -256,17 +338,30 @@ def process_released_entries(ws, records: List[ReleasedRecord], record_date: str
             if cur is None or r["start_date"] > cur["start_date"]:
                 open_rows_by_code[r["code"]] = r
 
+    # JPXは解除銘柄を解除後1週間程度そのまま掲載し続けるため、同じ解除情報が
+    # 何日も連続で取得される。既に解除日が記入済みの (コード, 解除日) を控えて
+    # おき、フォールバック行が毎日重複追加されるのを防ぐ。
+    released_keys = {(r["code"], r["end_date"]) for r in existing if r["end_date"]}
+
     cell_updates = []
     append_rows = []
     for rec in records:
+        if (rec.code, rec.end_date) in released_keys:
+            continue  # 反映済み
+
         target = open_rows_by_code.get(rec.code)
         if target:
             cell_updates.append({"range": f"E{target['sheet_row']}", "values": [[rec.end_date]]})
-            print(f"[{label}解除] {rec.code} {rec.name}  解除日:{rec.end_date} → {target['sheet_row']}行目に記入")
+            released_keys.add((rec.code, rec.end_date))
+            print(
+                f"[{label}解除] {rec.code} {rec.name}  解除日:{rec.end_date} "
+                f"→ {target['sheet_row']}行目に記入"
+            )
         else:
             append_rows.append(
                 [record_date, rec.code, rec.name, "", rec.end_date, rec.content, ""]
             )
+            released_keys.add((rec.code, rec.end_date))
             print(f"[{label}解除] 対応する未解除行なし: {rec.code} {rec.name} → 新規行として追加")
 
     if cell_updates:
@@ -286,30 +381,13 @@ RELEASED_COLS_REG = ["銘柄名", "コード", "解除日", "規制の内容"]
 
 
 def parse_margin_reg(html: str):
-    tables = pd.read_html(StringIO(html))
-
-    regulated_df = None
-    released_df = None
-    for t in tables:
-        cols = _flatten_columns(t.columns)
-        if regulated_df is None and all(c in cols for c in REGULATED_COLS):
-            t = t.copy()
-            t.columns = cols
-            regulated_df = t[REGULATED_COLS].copy()
-        elif released_df is None and all(c in cols for c in RELEASED_COLS_REG):
-            t = t.copy()
-            t.columns = cols
-            released_df = t[RELEASED_COLS_REG].copy()
-
-    if regulated_df is None or released_df is None:
-        _debug_dump_tables("信用取引に関する規制等", tables)
-        raise RuntimeError(
-            "信用取引に関する規制等: テーブルが見つかりません。"
-            "JPXのページ構成が変更された可能性があります。"
-        )
-
-    regulated_df = _clean_dataframe(regulated_df)
-    released_df = _clean_dataframe(released_df)
+    found = _find_tables(
+        html,
+        "信用取引に関する規制等",
+        {"regulated": REGULATED_COLS, "released": RELEASED_COLS_REG},
+    )
+    regulated_df = _clean_dataframe(found["regulated"])
+    released_df = _clean_dataframe(found["released"])
 
     new_records = [
         NewRecord(
@@ -323,7 +401,10 @@ def parse_margin_reg(html: str):
     ]
     released_records = [
         ReleasedRecord(
-            code=row["コード"], end_date=row["解除日"], name=row["銘柄名"], content=row["規制の内容"]
+            code=row["コード"],
+            end_date=row["解除日"],
+            name=row["銘柄名"],
+            content=row["規制の内容"],
         )
         for _, row in released_df.iterrows()
     ]
@@ -368,30 +449,13 @@ def marks_to_criteria(marks: str) -> str:
 
 
 def parse_margin_daily(html: str):
-    tables = pd.read_html(StringIO(html))
-
-    designated_df = None
-    released_df = None
-    for t in tables:
-        cols = _flatten_columns(t.columns)
-        if designated_df is None and all(c in cols for c in DESIGNATED_COLS):
-            t = t.copy()
-            t.columns = cols
-            designated_df = t[DESIGNATED_COLS].copy()
-        elif released_df is None and all(c in cols for c in RELEASED_COLS_DAILY):
-            t = t.copy()
-            t.columns = cols
-            released_df = t[RELEASED_COLS_DAILY].copy()
-
-    if designated_df is None or released_df is None:
-        _debug_dump_tables("信用取引に関する日々公表", tables)
-        raise RuntimeError(
-            "信用取引に関する日々公表: テーブルが見つかりません。"
-            "JPXのページ構成が変更された可能性があります。"
-        )
-
-    designated_df = _clean_dataframe(designated_df)
-    released_df = _clean_dataframe(released_df)
+    found = _find_tables(
+        html,
+        "信用取引に関する日々公表",
+        {"designated": DESIGNATED_COLS, "released": RELEASED_COLS_DAILY},
+    )
+    designated_df = _clean_dataframe(found["designated"])
+    released_df = _clean_dataframe(found["released"])
 
     new_records = []
     for _, row in designated_df.iterrows():
@@ -411,7 +475,10 @@ def parse_margin_daily(html: str):
         clean_name, _ = split_marks(row["銘柄名"])
         released_records.append(
             ReleasedRecord(
-                code=row["コード"], end_date=row["解除日"], name=clean_name, content=DAILY_CONTENT_LABEL
+                code=row["コード"],
+                end_date=row["解除日"],
+                name=clean_name,
+                content=DAILY_CONTENT_LABEL,
             )
         )
     return new_records, released_records
@@ -465,50 +532,19 @@ def main():
 
     print(f"=== JPX 信用取引規制データ 一括取得開始 (基準日: {record_date}) ===")
 
-    # --- 1. Playwrightでページをレンダリングして取得 ---
-    reg_html = None
-    daily_html = None
-    fetch_errors = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
-        try:
-            page = browser.new_page(user_agent=USER_AGENT)
-
-            if args.only in ("reg", "all"):
-                try:
-                    reg_html = render_page_html(page, MARGIN_REG_URL)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"エラー（増担保規制ページ取得）: {exc}", file=sys.stderr)
-                    fetch_errors.append(("増担保規制", exc))
-
-            if args.only in ("daily", "all"):
-                try:
-                    daily_html = render_page_html(page, MARGIN_DAILY_URL)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"エラー（日々公表銘柄ページ取得）: {exc}", file=sys.stderr)
-                    fetch_errors.append(("日々公表銘柄", exc))
-        finally:
-            browser.close()
-
-    if reg_html is None and daily_html is None:
-        print("=== 全フィードの取得に失敗しました ===", file=sys.stderr)
-        sys.exit(1)
-
-    # --- 2. Googleスプレッドシートへ差分反映 ---
     gc = get_gspread_client()
-    errors = list(fetch_errors)
+    errors = []
 
-    if reg_html is not None:
+    if args.only in ("reg", "all"):
         try:
-            run_margin_reg(gc, record_date, reg_html)
+            run_margin_reg(gc, record_date, fetch_html(MARGIN_REG_URL))
         except Exception as exc:  # noqa: BLE001
             print(f"エラー（増担保規制）: {exc}", file=sys.stderr)
             errors.append(("増担保規制", exc))
 
-    if daily_html is not None:
+    if args.only in ("daily", "all"):
         try:
-            run_margin_daily(gc, record_date, daily_html)
+            run_margin_daily(gc, record_date, fetch_html(MARGIN_DAILY_URL))
         except Exception as exc:  # noqa: BLE001
             print(f"エラー（日々公表銘柄）: {exc}", file=sys.stderr)
             errors.append(("日々公表銘柄", exc))
