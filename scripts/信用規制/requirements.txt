@@ -3,12 +3,12 @@
 # 6.x系に固定しつつスクリプト側は常にキーワード引数で呼び出している。
 gspread>=6.1.2,<7.0.0
 google-auth>=2.29.0
- 
-# JPXページ取得・HTML解析
-requests>=2.31.0
+
+# JPXページ取得（本文がJSで描画されるためヘッドレスブラウザを使用）・HTML解析
+playwright>=1.44.0
 pandas>=2.2.0
 lxml>=5.2.0
 beautifulsoup4>=4.12.3
- 
+
 # 営業日判定（土日祝の実行スキップ用）
 jpholiday>=0.1.9
