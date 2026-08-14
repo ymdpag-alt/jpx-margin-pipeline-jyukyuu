@@ -3,7 +3,7 @@ name: JPX 空売り業種別集計 取得
 on:
   schedule:
     # 毎週月〜金 21:30 JST (= 12:30 UTC) に実行
-    - cron: "40 9 * * 1-5"
+    - cron: "30 8 * * 1-5"
   workflow_dispatch:
     inputs:
       target_date:
