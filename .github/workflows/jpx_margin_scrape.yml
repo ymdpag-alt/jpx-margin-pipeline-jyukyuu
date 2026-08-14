@@ -45,10 +45,6 @@ jobs:
         working-directory: scripts/信用規制
         run: pip install -r requirements.txt
 
-      - name: Playwright Chromiumをインストール
-        working-directory: scripts/信用規制
-        run: playwright install --with-deps chromium
-
       - name: JPX信用取引規制データを取得してスプレッドシートに書き込み
         working-directory: scripts/信用規制
         env:
