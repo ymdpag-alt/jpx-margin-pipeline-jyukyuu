@@ -25,10 +25,21 @@ JPX 信用取引規制データ 一括取得スクリプト
     - 「解除された銘柄」一覧は、コードが一致しE列が空欄の行を探して解除日を記入
     - 対応する未解除行が見つからない場合は、情報を失わないよう新規行として追加
 
+ページ取得について:
+    JPXの両ページは本文（テーブル）をJavaScriptで描画しているため、
+    requestsによる静的HTML取得では取得できない。Playwright(Chromium)で
+    レンダリング後のHTMLを取得してから解析する。
+
 日付の扱い:
     JPXのページは常に「最新の状態」のスナップショットであり、過去日を指定して
     別のデータを取得することはできない。--date は「新規記載日（A列）」に書き込む
     基準日を指定するためのオプションであり、省略時は実行日（JST）を使用する。
+
+非営業日のスキップについて:
+    JPXのページは非営業日（土日・祝日・年末年始）には更新されない。無駄な
+    実行を避けるため、対象日（--date指定日、または実行日）が非営業日の場合は
+    デフォルトで処理をスキップする。--force を付けると営業日判定を無視して
+    強制的に取得・反映する（手動バックフィル等で使用）。
 
 使い方:
     python jpx_margin_scraper.py                    # 増担保規制・日々公表銘柄を一括実行（既定）
@@ -36,12 +47,6 @@ JPX 信用取引規制データ 一括取得スクリプト
     python jpx_margin_scraper.py --only reg          # 増担保規制のみ
     python jpx_margin_scraper.py --only daily        # 日々公表銘柄のみ
     python jpx_margin_scraper.py --force             # 非営業日でも強制実行
-
-非営業日のスキップについて:
-    JPXのページは非営業日（土日・祝日・年末年始）には更新されない。無駄な
-    実行を避けるため、対象日（--date指定日、または実行日）が非営業日の場合は
-    デフォルトで処理をスキップする。--force を付けると営業日判定を無視して
-    強制的に取得・反映する（手動バックフィル等で使用）。
 """
 
 import argparse
@@ -57,8 +62,9 @@ from typing import Dict, List, Optional
 import gspread
 import jpholiday
 import pandas as pd
-import requests
 from google.oauth2.service_account import Credentials
+from playwright.sync_api import TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright
 from zoneinfo import ZoneInfo
 
 # =============================================================================
@@ -81,12 +87,12 @@ SPREADSHEET_ID = _env_str("SPREADSHEET_ID", "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRRE
 MARGIN_REG_GID = _env_int("MARGIN_REG_GID", 1552537213)
 MARGIN_DAILY_GID = _env_int("MARGIN_DAILY_GID", 173915474)
 
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+PAGE_LOAD_TIMEOUT_MS = 45000
+TABLE_WAIT_TIMEOUT_MS = 20000
 
 SHEET_HEADER = ["新規記載日", "コード", "銘柄名", "実施日", "解除日", "規制の内容", "該当基準"]
 
@@ -126,6 +132,47 @@ def is_business_day(dt: datetime) -> bool:
     if jpholiday.is_holiday(dt.date()):
         return False
     return True
+
+
+# =============================================================================
+# ページ取得（Playwrightでレンダリング後のHTMLを取得）
+# =============================================================================
+def render_page_html(page, url: str) -> str:
+    print(f"取得中: {url}")
+    page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+    try:
+        page.wait_for_selector("table", timeout=TABLE_WAIT_TIMEOUT_MS)
+    except PWTimeoutError:
+        print(f"  ※ table要素の出現待機がタイムアウトしました。取得できた時点のHTMLで解析を試みます。")
+    return page.content()
+
+
+# =============================================================================
+# HTML解析 共通ユーティリティ
+# =============================================================================
+def _flatten_columns(columns) -> List[str]:
+    """pandas.read_htmlがMultiIndex列を返した場合でも単純な文字列リストに正規化する"""
+    flat = []
+    for c in columns:
+        if isinstance(c, tuple):
+            parts = [str(x).strip() for x in c if str(x).strip() and not str(x).startswith("Unnamed")]
+            flat.append("".join(parts) if parts else str(c[-1]).strip())
+        else:
+            flat.append(str(c).strip())
+    return flat
+
+
+def _debug_dump_tables(label: str, tables) -> None:
+    print(f"[{label}] 取得できたtable数: {len(tables)}")
+    for i, t in enumerate(tables):
+        print(f"  table[{i}] shape={t.shape} columns={_flatten_columns(t.columns)}")
+
+
+def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+    df.drop(df[df["コード"].isin(["nan", "", "－", "-"])].index, inplace=True)
+    return df
 
 
 # =============================================================================
@@ -238,31 +285,31 @@ REGULATED_COLS = ["銘柄名", "コード", "実施日", "規制の内容", "該
 RELEASED_COLS_REG = ["銘柄名", "コード", "解除日", "規制の内容"]
 
 
-def fetch_margin_reg():
-    resp = requests.get(MARGIN_REG_URL, headers=REQUEST_HEADERS, timeout=30)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding
-    tables = pd.read_html(StringIO(resp.text))
+def parse_margin_reg(html: str):
+    tables = pd.read_html(StringIO(html))
 
     regulated_df = None
     released_df = None
     for t in tables:
-        cols = list(t.columns)
+        cols = _flatten_columns(t.columns)
         if regulated_df is None and all(c in cols for c in REGULATED_COLS):
+            t = t.copy()
+            t.columns = cols
             regulated_df = t[REGULATED_COLS].copy()
         elif released_df is None and all(c in cols for c in RELEASED_COLS_REG):
+            t = t.copy()
+            t.columns = cols
             released_df = t[RELEASED_COLS_REG].copy()
 
     if regulated_df is None or released_df is None:
+        _debug_dump_tables("信用取引に関する規制等", tables)
         raise RuntimeError(
             "信用取引に関する規制等: テーブルが見つかりません。"
             "JPXのページ構成が変更された可能性があります。"
         )
 
-    for df in (regulated_df, released_df):
-        for col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-        df.drop(df[df["コード"].isin(["nan", "", "－", "-"])].index, inplace=True)
+    regulated_df = _clean_dataframe(regulated_df)
+    released_df = _clean_dataframe(released_df)
 
     new_records = [
         NewRecord(
@@ -283,9 +330,9 @@ def fetch_margin_reg():
     return new_records, released_records
 
 
-def run_margin_reg(gc, record_date):
+def run_margin_reg(gc, record_date, html):
     print("--- 信用取引に関する規制等（増担保規制） ---")
-    new_records, released_records = fetch_margin_reg()
+    new_records, released_records = parse_margin_reg(html)
     print(f"取得件数: 規制中 {len(new_records)} 件 / 解除 {len(released_records)} 件")
     ws = open_worksheet(gc, MARGIN_REG_GID)
     ensure_header(ws)
@@ -320,31 +367,31 @@ def marks_to_criteria(marks: str) -> str:
     return " / ".join(parts)
 
 
-def fetch_margin_daily():
-    resp = requests.get(MARGIN_DAILY_URL, headers=REQUEST_HEADERS, timeout=30)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding
-    tables = pd.read_html(StringIO(resp.text))
+def parse_margin_daily(html: str):
+    tables = pd.read_html(StringIO(html))
 
     designated_df = None
     released_df = None
     for t in tables:
-        cols = list(t.columns)
+        cols = _flatten_columns(t.columns)
         if designated_df is None and all(c in cols for c in DESIGNATED_COLS):
+            t = t.copy()
+            t.columns = cols
             designated_df = t[DESIGNATED_COLS].copy()
         elif released_df is None and all(c in cols for c in RELEASED_COLS_DAILY):
+            t = t.copy()
+            t.columns = cols
             released_df = t[RELEASED_COLS_DAILY].copy()
 
     if designated_df is None or released_df is None:
+        _debug_dump_tables("信用取引に関する日々公表", tables)
         raise RuntimeError(
             "信用取引に関する日々公表: テーブルが見つかりません。"
             "JPXのページ構成が変更された可能性があります。"
         )
 
-    for df in (designated_df, released_df):
-        for col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-        df.drop(df[df["コード"].isin(["nan", "", "－", "-"])].index, inplace=True)
+    designated_df = _clean_dataframe(designated_df)
+    released_df = _clean_dataframe(released_df)
 
     new_records = []
     for _, row in designated_df.iterrows():
@@ -370,9 +417,9 @@ def fetch_margin_daily():
     return new_records, released_records
 
 
-def run_margin_daily(gc, record_date):
+def run_margin_daily(gc, record_date, html):
     print("--- 信用取引に関する日々公表（日々公表銘柄） ---")
-    new_records, released_records = fetch_margin_daily()
+    new_records, released_records = parse_margin_daily(html)
     print(f"取得件数: 日々公表 {len(new_records)} 件 / 解除 {len(released_records)} 件")
     ws = open_worksheet(gc, MARGIN_DAILY_GID)
     ensure_header(ws)
@@ -418,20 +465,50 @@ def main():
 
     print(f"=== JPX 信用取引規制データ 一括取得開始 (基準日: {record_date}) ===")
 
-    gc = get_gspread_client()
+    # --- 1. Playwrightでページをレンダリングして取得 ---
+    reg_html = None
+    daily_html = None
+    fetch_errors = []
 
-    errors = []
-
-    if args.only in ("reg", "all"):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
-            run_margin_reg(gc, record_date)
+            page = browser.new_page(user_agent=USER_AGENT)
+
+            if args.only in ("reg", "all"):
+                try:
+                    reg_html = render_page_html(page, MARGIN_REG_URL)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"エラー（増担保規制ページ取得）: {exc}", file=sys.stderr)
+                    fetch_errors.append(("増担保規制", exc))
+
+            if args.only in ("daily", "all"):
+                try:
+                    daily_html = render_page_html(page, MARGIN_DAILY_URL)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"エラー（日々公表銘柄ページ取得）: {exc}", file=sys.stderr)
+                    fetch_errors.append(("日々公表銘柄", exc))
+        finally:
+            browser.close()
+
+    if reg_html is None and daily_html is None:
+        print("=== 全フィードの取得に失敗しました ===", file=sys.stderr)
+        sys.exit(1)
+
+    # --- 2. Googleスプレッドシートへ差分反映 ---
+    gc = get_gspread_client()
+    errors = list(fetch_errors)
+
+    if reg_html is not None:
+        try:
+            run_margin_reg(gc, record_date, reg_html)
         except Exception as exc:  # noqa: BLE001
             print(f"エラー（増担保規制）: {exc}", file=sys.stderr)
             errors.append(("増担保規制", exc))
 
-    if args.only in ("daily", "all"):
+    if daily_html is not None:
         try:
-            run_margin_daily(gc, record_date)
+            run_margin_daily(gc, record_date, daily_html)
         except Exception as exc:  # noqa: BLE001
             print(f"エラー（日々公表銘柄）: {exc}", file=sys.stderr)
             errors.append(("日々公表銘柄", exc))
