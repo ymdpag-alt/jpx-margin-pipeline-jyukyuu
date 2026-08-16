@@ -41,7 +41,7 @@ from typing import Optional
 
 import requests
 
-JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/00-archives-01.html"
+JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/00-archives-02.html"
 
 # ------------------------------------------------------------------
 # 1. JPXサイトから最新(または指定日)の「株式相場表」PDFリンクを取得
