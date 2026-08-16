@@ -69,6 +69,21 @@ ABORT_AFTER_EMPTY_CHUNKS = int(os.environ.get("ABORT_AFTER_EMPTY_CHUNKS", "3"))
 
 FIXED_COLS = 2
 
+# ---- 待機時間・リトライ関連のチューニング値 ---------------------------------
+YF_DOWNLOAD_TIMEOUT_SEC = 45       # yf.download の HTTP タイムアウト
+BACKOFF_JITTER_MAX_SEC = 3.0       # リトライ待機に加えるランダムジッターの上限
+EMPTY_CHUNK_SLEEP_MULTIPLIER = 2   # 空データだったチャンクの追加待機倍率（SLEEP_TIME に乗算）
+CHUNK_SLEEP_JITTER_MAX_SEC = 1.0   # チャンク間の通常待機に加えるランダムジッターの上限
+
+# ---- 価格取得期間のバッファ -------------------------------------------------
+PRICE_FETCH_LOOKBACK_DAYS = 7      # 対象日より前に遡って取得する日数（休場日対策）
+PRICE_FETCH_LOOKAHEAD_DAYS = 1     # 対象日より後に伸ばして取得する日数（end は排他的なため）
+
+# ---- Google スプレッドシート書き込み関連 ------------------------------------
+DEFAULT_MIN_COLS = 50              # ワークシートを開く際に確保しておく最小列数
+BATCH_UPDATE_CHUNK_SIZE = 500      # batch_update を分割送信する際の1回あたりの件数上限
+SORT_PREVIEW_COUNT = 5             # 日付列ソート完了ログに表示する先頭件数
+
 _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 
 
@@ -118,7 +133,7 @@ def authenticate_google_sheets() -> gspread.Client:
 
 
 def get_worksheet_by_gid(
-    gc: gspread.Client, gid: int, min_cols: int = 50
+    gc: gspread.Client, gid: int, min_cols: int = DEFAULT_MIN_COLS
 ) -> gspread.Worksheet:
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
     ws = spreadsheet.get_worksheet_by_id(gid)
@@ -187,7 +202,7 @@ def _download_with_retry(chunk: list[str], start: str, end: str):
                 auto_adjust=False,
                 group_by="column",
                 threads=False,
-                timeout=45,
+                timeout=YF_DOWNLOAD_TIMEOUT_SEC,
             )
         except Exception as e:
             log(f"    [attempt {attempt}/{MAX_ATTEMPTS}] {type(e).__name__}: {e}")
@@ -196,7 +211,7 @@ def _download_with_retry(chunk: list[str], start: str, end: str):
             return raw
 
         if attempt < MAX_ATTEMPTS:
-            wait = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 3.0)
+            wait = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, BACKOFF_JITTER_MAX_SEC)
             log(f"    [attempt {attempt}/{MAX_ATTEMPTS}] 空データ。{wait:.1f}秒待機")
             time.sleep(wait)
     return None
@@ -230,8 +245,8 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
     追加のAPIコストなしに Open/High/Low を Close/Volume と同時に取得できる。
     """
     tickers = [f"{c}.T" for c in codes]
-    start = str(pd.to_datetime(min(target_dates)) - pd.Timedelta(days=7))[:10]
-    end = str(pd.to_datetime(max(target_dates)) + pd.Timedelta(days=1))[:10]
+    start = str(pd.to_datetime(min(target_dates)) - pd.Timedelta(days=PRICE_FETCH_LOOKBACK_DAYS))[:10]
+    end = str(pd.to_datetime(max(target_dates)) + pd.Timedelta(days=PRICE_FETCH_LOOKAHEAD_DAYS))[:10]
     target_date_map = {pd.to_datetime(d).date(): d for d in target_dates}
 
     total_chunks = (len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -261,7 +276,7 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
                     f"残り {total_chunks - chunk_num} チャンクをスキップして書き込みへ進みます。"
                 )
                 break
-            time.sleep(SLEEP_TIME * 2)
+            time.sleep(SLEEP_TIME * EMPTY_CHUNK_SLEEP_MULTIPLIER)
             continue
 
         if chunk_num == 1:
@@ -319,7 +334,7 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
             consecutive_empty = 0
             log(f"  [{chunk_num}/{total_chunks}] {len(chunk)}銘柄中 {filled_chunk}件 取得")
 
-        time.sleep(SLEEP_TIME + random.uniform(0, 1.0))
+        time.sleep(SLEEP_TIME + random.uniform(0, CHUNK_SLEEP_JITTER_MAX_SEC))
 
     fill_rate = len(filled_codes) / len(codes) if codes else 0.0
     log(f"\n取得成功: {len(filled_codes)}/{len(codes)} 銘柄 ({fill_rate:.1%})")
@@ -382,6 +397,10 @@ def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
         return
 
     header = existing[0]
+
+    # ★ 既存シートのA列コード→行番号の辞書を作り、以降はこのコードをキーに
+    #    値を引き当てて書き込む（行の並び順には依存しない）ため、
+    #    シート上の実際のコードと一致した行にだけ値が入る。
     code_to_row = {}
     for r, row in enumerate(existing[1:], start=2):
         if row and row[0]:
@@ -426,8 +445,8 @@ def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
 
     if batch_updates:
         log(f"  既存銘柄を更新: {len(batch_updates)} 件")
-        for i in range(0, len(batch_updates), 500):
-            ws.batch_update(batch_updates[i : i + 500],
+        for i in range(0, len(batch_updates), BATCH_UPDATE_CHUNK_SIZE):
+            ws.batch_update(batch_updates[i : i + BATCH_UPDATE_CHUNK_SIZE],
                             value_input_option="USER_ENTERED")
 
     if new_rows:
@@ -478,8 +497,8 @@ def sort_date_columns(gc: gspread.Client, gid: int):
     ws.update(values=new_data, range_name=f"A1:{end_a1}",
               value_input_option="USER_ENTERED")
 
-    preview = " → ".join(sorted_header[:5])
-    suffix = "..." if len(sorted_header) > 5 else ""
+    preview = " → ".join(sorted_header[:SORT_PREVIEW_COUNT])
+    suffix = "..." if len(sorted_header) > SORT_PREVIEW_COUNT else ""
     log(f"  ソート完了: {len(sorted_header)} 列（{preview}{suffix}）")
 
 
@@ -520,8 +539,8 @@ def main():
     if not codes:
         die("銘柄コードが0件でした。タブの内容を確認してください。")
 
-    start = str(pd.to_datetime(min(TARGET_DATES)) - pd.Timedelta(days=7))[:10]
-    end = str(pd.to_datetime(max(TARGET_DATES)) + pd.Timedelta(days=1))[:10]
+    start = str(pd.to_datetime(min(TARGET_DATES)) - pd.Timedelta(days=PRICE_FETCH_LOOKBACK_DAYS))[:10]
+    end = str(pd.to_datetime(max(TARGET_DATES)) + pd.Timedelta(days=PRICE_FETCH_LOOKAHEAD_DAYS))[:10]
     smoke_test(start, end)
 
     values = fetch_prices(codes, TARGET_DATES)
