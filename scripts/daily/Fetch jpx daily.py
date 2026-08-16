@@ -47,7 +47,7 @@ import requests
 # ====================================================================
 
 # --- JPX 日報 index ページ -------------------------------------------------
-JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/00-archives-03.html"
+JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/index.html"
 
 # --- 日付表示フォーマット用 -------------------------------------------------
 # date.weekday(): 月=0, 火=1, 水=2, 木=3, 金=4, 土=5, 日=6
