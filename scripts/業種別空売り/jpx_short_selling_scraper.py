@@ -10,8 +10,11 @@ JPX 空売り集計（業種別集計）日次データ → Googleスプレッ�
   コマンドライン : python jpx_short_selling_scraper.py 2026/08/05
   環境変数       : TARGET_DATE=2026/08/05 python jpx_short_selling_scraper.py
   ※ JPXの一覧ページには直近5営業日分しか掲載されないため、それより古い日付は取得不可。
+  ※ 上記の日付指定はJPXサイトの一覧表示形式（YYYY/MM/DD）に合わせたものです。
+     一方、スプレッドシートに書き込まれる日付列の見出しは "2026年8月7日(金)" 形式になります。
 """
 
+import datetime as dt
 import io
 import json
 import os
@@ -57,6 +60,12 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# --- シートレイアウト ---
+IND_HEADER_LABEL = "業種（単位：百万円）"  # A1セルに書き込む見出し文字列
+DATA_HEADER_ROW  = 1  # 日付・見出しが入る行（1行目）
+DATA_START_ROW   = 2  # 業種データが始まる行（2行目）
+DATA_START_COL   = 3  # 日付データの書き込み開始列（C列, 1-based）
+
 # --- 業種リスト（PDF掲載順）33業種 ＋ その他（33業種外）---
 INDUSTRY_ORDER = [
     "水産・農林業",         "鉱業",               "建設業",
@@ -89,6 +98,22 @@ ROW_RE = re.compile(
 )
 DATE_RE = re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
 
+# --- 日付表示フォーマット用 ---
+# dt.date.weekday(): 月=0, 火=1, 水=2, 木=3, 金=4, 土=5, 日=6
+WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+# ================================================================
+#  日付フォーマット
+# ================================================================
+
+def format_date_jp(d: dt.date) -> str:
+    """
+    date オブジェクトを "2026年8月7日(金)" 形式の文字列に変換する。
+    スプレッドシートの日付列見出しとして使用する。
+    """
+    return f"{d.year}年{d.month}月{d.day}日({WEEKDAY_JP[d.weekday()]})"
+
 
 # ================================================================
 #  PDF 取得・パース
@@ -98,6 +123,8 @@ def get_pdf_url(target_date: Optional[str] = None) -> str:
     """
     一覧ページから業種別集計PDF URLを取得する。
     target_date が None なら最新日付、"YYYY/MM/DD" 形式で指定すると該当日付を返す。
+    ※ ここでの target_date はJPXサイトの一覧表示形式（YYYY/MM/DD）と突き合わせるため、
+       その形式のまま扱う（スプレッドシートに書き込む日付とは別物）。
     ※ 一覧には直近5営業日分のみ掲載。それより古い日付はエラーになる。
     """
     resp = requests.get(JPX_INDEX_URL, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
@@ -152,7 +179,7 @@ def parse_pdf(pdf_bytes: bytes) -> tuple[str, dict]:
     PDF から日付と業種別データを抽出する。
 
     Returns:
-        target_date : "YYYY/MM/DD"
+        target_date : "2026年8月7日(金)" 形式の日付文字列（スプレッドシート書き込み用）
         data        : {業種名: {"a": int, "b": int, "c": int, "d": int}}  単位: 百万円
     """
     full_text = ""
@@ -165,7 +192,7 @@ def parse_pdf(pdf_bytes: bytes) -> tuple[str, dict]:
     if not date_m:
         raise RuntimeError("PDFから日付を抽出できませんでした。")
     y, m, d = date_m.groups()
-    target_date = f"{int(y):04d}/{int(m):02d}/{int(d):02d}"
+    target_date = format_date_jp(dt.date(int(y), int(m), int(d)))
 
     # 業種データ抽出
     data = {}
@@ -211,49 +238,55 @@ def col_letter(col_idx: int) -> str:
 
 
 def ensure_industry_column(ws: gspread.Worksheet) -> None:
-    """A列の業種名が未設定の場合のみ初期書き込みする。"""
+    """
+    A列の業種名が未設定の場合のみ初期書き込みする。
+    ★ ここで書き込む行順は常に INDUSTRY_ORDER の並びそのもの。write_date_column() 側も
+      同じ INDUSTRY_ORDER の並びでデータを積むため、両者の行位置は常に一致する
+      （コード列を持つ他スクリプトのような「値を見て一致する行を探す」照合ではなく、
+      固定リストの並びを前提にした位置合わせである点に注意）。
+    """
     if len(ws.col_values(1)) >= len(INDUSTRY_ORDER) + 1:
         return  # 設定済みならスキップ
-    header = [["業種（単位：百万円）", ""]]
+    header = [[IND_HEADER_LABEL, ""]]
     rows   = [[name, ""] for name in INDUSTRY_ORDER]
-    ws.update(range_name="A1", values=header + rows)
+    ws.update(range_name=f"A{DATA_HEADER_ROW}", values=header + rows)
     print(f"      → A列に業種名を初期書き込みしました（{len(INDUSTRY_ORDER)}業種）")
 
 
 def write_date_column(ws: gspread.Worksheet, target_date: str, key: str, data: dict) -> None:
-    """C列以降に日付列を書き込む。
+    """DATA_START_COL（C列）以降に日付列を書き込む。
     - 同日付が既存 → 上書き（位置はそのまま）
     - 新規日付     → C列に1列挿入して既存データを右にシフト
     """
-    header_row = ws.row_values(1)
+    header_row = ws.row_values(DATA_HEADER_ROW)
 
-    # C列（idx=3）以降から同日付の既存列を探す
+    # C列（DATA_START_COL）以降から同日付の既存列を探す
     target_col: Optional[int] = None
     for idx, val in enumerate(header_row, start=1):
-        if idx >= 3 and val == target_date:
+        if idx >= DATA_START_COL and val == target_date:
             target_col = idx
             break
 
     if target_col is None:
-        # ── 新規日付: C列（0-based index=2）に1列挿入して右シフト ──
+        # ── 新規日付: C列に1列挿入して右シフト ──
         ws.spreadsheet.batch_update({
             "requests": [{
                 "insertDimension": {
                     "range": {
                         "sheetId": ws.id,
                         "dimension": "COLUMNS",
-                        "startIndex": 2,   # 0-based: A=0, B=1, C=2
-                        "endIndex": 3,
+                        "startIndex": DATA_START_COL - 1,  # 0-based: A=0, B=1, C=2
+                        "endIndex": DATA_START_COL,
                     },
                     "inheritFromBefore": False,
                 }
             }]
         })
-        target_col = 3  # C列（1-based）
+        target_col = DATA_START_COL
 
     letter = col_letter(target_col)
-    ws.update(range_name=f"{letter}1", values=[[target_date]])
-    ws.update(range_name=f"{letter}2", values=[[data[name][key]] for name in INDUSTRY_ORDER])
+    ws.update(range_name=f"{letter}{DATA_HEADER_ROW}", values=[[target_date]])
+    ws.update(range_name=f"{letter}{DATA_START_ROW}", values=[[data[name][key]] for name in INDUSTRY_ORDER])
 
 
 # ================================================================
@@ -262,6 +295,8 @@ def write_date_column(ws: gspread.Worksheet, target_date: str, key: str, data: d
 
 def main() -> None:
     # 日付の優先順位: コマンドライン引数 > 環境変数 TARGET_DATE > None（最新）
+    # ※ この target_date はJPXサイトの一覧表示形式（YYYY/MM/DD）に合わせる必要があるため
+    #    そのままの形式で扱う（スプレッドシート書き込み用の日付は parse_pdf() 側で生成される）。
     target_date: Optional[str] = None
     if len(sys.argv) >= 2:
         target_date = sys.argv[1]
