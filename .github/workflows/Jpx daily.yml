@@ -39,7 +39,7 @@ jobs:
         working-directory: scripts/daily
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}  # 未設定でもOK(スクリプト内デフォルトを使用)
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID2 }}  # 未設定でもOK(スクリプト内デフォルトを使用)
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.date }}" ]; then
