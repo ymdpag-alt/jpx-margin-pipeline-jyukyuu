@@ -41,11 +41,112 @@ from typing import Optional
 
 import requests
 
+
+# ====================================================================
+# 定数定義
+# ====================================================================
+
+# --- JPX 日報 index ページ -------------------------------------------------
 JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/index.html"
 
-# ------------------------------------------------------------------
+# --- 日付表示フォーマット用 -------------------------------------------------
+# date.weekday(): 月=0, 火=1, 水=2, 木=3, 金=4, 土=5, 日=6
+WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
+
+# --- テキストパース用の正規表現 ---------------------------------------------
+CODE_RE_STR = r'[0-9][0-9A-Za-z]{3}'
+NUM = r'[\d,]+(?:\.\d+)?'
+
+DATA_LINE_RE = re.compile(
+    r'^(?P<code>' + CODE_RE_STR + r')\s+'
+    r'(?P<unit>\d+)\s+'
+    r'(?P<name_jp>\S+)\s+'
+    r'(?P<am_open>' + NUM + r')\s+'
+    r'(?P<am_high>' + NUM + r')\s+'
+    r'(?P<am_low>' + NUM + r')\s+'
+    r'(?P<am_close>' + NUM + r')\s+'
+    r'(?P<pm_open>' + NUM + r')\s+'
+    r'(?P<pm_high>' + NUM + r')\s+'
+    r'(?P<pm_low>' + NUM + r')\s+'
+    r'(?P<pm_close>' + NUM + r')\s+'
+    # 「最終気配」が"－"(特殊気配なし)の場合、文字幅が非常に狭いため
+    # 直後の「前日比」の数値とスペース無しで連結されてしまうことがある(例: "－30.00")。
+    # そのためこの境界だけ空白ゼロ許容(\s*)にする。
+    r'(?P<final_quote>[－ー―]|' + NUM + r')\s*'
+    r'(?P<net_change>-?' + NUM + r')\s+'
+    r'(?P<vwap>' + NUM + r')\s+'
+    r'(?P<volume>' + NUM + r')\s+'
+    r'(?P<value>' + NUM + r')\s*$'
+)
+
+# ページ毎に繰り返される定型ヘッダー/フッター行(実際のPDF出力に合わせたもの)
+HEADER_JUNK_EXACT = {
+    "株 式 相 場 表", "Stock Quotations",
+    "立 会 市 場 普 通 取 引", "Auction Trades Regular Way",
+    "午前 (The morning trading session) 午後 (The afternoon trading session)",
+    "売買 売買高加重",
+    "コード 銘柄名 最終気配 前日比 売買高 売買代金",
+    "単位 始値 高値 安値 終値 始値 高値 安値 終値 平均価格",
+    "Trading",
+    "Code Issues Open High Low Close Open High Low Close Final special quote "
+    "Net Change VWAP Trading Volume Trading Value",
+    "Unit",
+    "円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] "
+    "千株[thous.shs.] 千円[￥thous.]",
+    "千口/千個[thous.units.]",
+}
+DATE_PAGE_RE = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日')
+COPYRIGHT_RE = re.compile(r'^Copyright \(c\) Tokyo Stock Exchange')
+
+# 「市場」列に転記する対象(和文見出しそのまま)
+MARKET_HEADERS = {"プライム市場", "スタンダード市場", "グロース市場"}
+# 内容としては情報を持つが、業種欄には転記したくない行(英語版の市場見出し等)
+NON_INDUSTRY_OTHER_LINES = {
+    "Prime Market", "Standard Market", "Growth Market",
+    "内国株式", "Domestic Stock", "外国株式", "Foreign Stock",
+    "Ｒ Ｅ Ｉ Ｔ", "REIT",
+}
+
+# --- Google スプレッドシート関連 --------------------------------------------
+# 対象スプレッドシートID (URLの /d/ と /edit の間の文字列)
+# 環境変数 SPREADSHEET_ID2 が設定されていればそちらを優先する(別スプレッドシートに切り替えたい場合用)
+SPREADSHEET_ID_DEFAULT = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
+
+# 各項目シートのgid (URLの gid= の値)
+SHEET_SPECS = [
+    # (表示名, gid, レコードのキー)
+    ("前場始値", 519462541, "am_open"),
+    ("前場高値", 1702721662, "am_high"),
+    ("前場安値", 1992276623, "am_low"),
+    ("前場終値", 1876491327, "am_close"),
+    ("後場始値", 584913773, "pm_open"),
+    ("後場高値", 1279938624, "pm_high"),
+    ("後場安値", 1826620378, "pm_low"),
+    ("後場終値", 1061743785, "pm_close"),
+    ("VWAP", 582188033, "vwap"),
+    ("出来高", 46406858, "volume"),
+]
+HEADER_ROW = ["コード", "銘柄名", "業種", "市場"]
+DATA_START_COL = 5  # E列(1-indexed)
+
+LOG_SHEET_TITLE = "_ProcessedDates"
+
+
+# ====================================================================
+# 日付フォーマット
+# ====================================================================
+
+def format_date_jp(d: date) -> str:
+    """
+    date オブジェクトを "2026年8月7日(金)" 形式の文字列に変換する。
+    スプレッドシートに書き込む日付列の見出し・ログシートの日付として使用する。
+    """
+    return f"{d.year}年{d.month}月{d.day}日({WEEKDAY_JP[d.weekday()]})"
+
+
+# ====================================================================
 # 1. JPXサイトから最新(または指定日)の「株式相場表」PDFリンクを取得
-# ------------------------------------------------------------------
+# ====================================================================
 
 def find_pdf_url(target_date: Optional[date] = None) -> tuple[str, date]:
     """
@@ -84,9 +185,9 @@ def find_pdf_url(target_date: Optional[date] = None) -> tuple[str, date]:
                         "(休場日、まだ掲載されていない、または一覧の表示範囲外の可能性があります)。")
 
 
-# ------------------------------------------------------------------
+# ====================================================================
 # 2. PDFダウンロード & テキスト抽出
-# ------------------------------------------------------------------
+# ====================================================================
 
 def download_pdf(url: str) -> bytes:
     resp = requests.get(url, timeout=60)
@@ -142,63 +243,9 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------------
+# ====================================================================
 # 3. テキストパース
-# ------------------------------------------------------------------
-
-CODE_RE_STR = r'[0-9][0-9A-Za-z]{3}'
-
-NUM = r'[\d,]+(?:\.\d+)?'
-DATA_LINE_RE = re.compile(
-    r'^(?P<code>' + CODE_RE_STR + r')\s+'
-    r'(?P<unit>\d+)\s+'
-    r'(?P<name_jp>\S+)\s+'
-    r'(?P<am_open>' + NUM + r')\s+'
-    r'(?P<am_high>' + NUM + r')\s+'
-    r'(?P<am_low>' + NUM + r')\s+'
-    r'(?P<am_close>' + NUM + r')\s+'
-    r'(?P<pm_open>' + NUM + r')\s+'
-    r'(?P<pm_high>' + NUM + r')\s+'
-    r'(?P<pm_low>' + NUM + r')\s+'
-    r'(?P<pm_close>' + NUM + r')\s+'
-    # 「最終気配」が"－"(特殊気配なし)の場合、文字幅が非常に狭いため
-    # 直後の「前日比」の数値とスペース無しで連結されてしまうことがある(例: "－30.00")。
-    # そのためこの境界だけ空白ゼロ許容(\s*)にする。
-    r'(?P<final_quote>[－ー―]|' + NUM + r')\s*'
-    r'(?P<net_change>-?' + NUM + r')\s+'
-    r'(?P<vwap>' + NUM + r')\s+'
-    r'(?P<volume>' + NUM + r')\s+'
-    r'(?P<value>' + NUM + r')\s*$'
-)
-
-# ページ毎に繰り返される定型ヘッダー/フッター行(実際のPDF出力に合わせたもの)
-HEADER_JUNK_EXACT = {
-    "株 式 相 場 表", "Stock Quotations",
-    "立 会 市 場 普 通 取 引", "Auction Trades Regular Way",
-    "午前 (The morning trading session) 午後 (The afternoon trading session)",
-    "売買 売買高加重",
-    "コード 銘柄名 最終気配 前日比 売買高 売買代金",
-    "単位 始値 高値 安値 終値 始値 高値 安値 終値 平均価格",
-    "Trading",
-    "Code Issues Open High Low Close Open High Low Close Final special quote "
-    "Net Change VWAP Trading Volume Trading Value",
-    "Unit",
-    "円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] 円[￥] "
-    "千株[thous.shs.] 千円[￥thous.]",
-    "千口/千個[thous.units.]",
-}
-DATE_PAGE_RE = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日')
-COPYRIGHT_RE = re.compile(r'^Copyright \(c\) Tokyo Stock Exchange')
-
-# 「市場」列に転記する対象(和文見出しそのまま)
-MARKET_HEADERS = {"プライム市場", "スタンダード市場", "グロース市場"}
-# 内容としては情報を持つが、業種欄には転記したくない行(英語版の市場見出し等)
-NON_INDUSTRY_OTHER_LINES = {
-    "Prime Market", "Standard Market", "Growth Market",
-    "内国株式", "Domestic Stock", "外国株式", "Foreign Stock",
-    "Ｒ Ｅ Ｉ Ｔ", "REIT",
-}
-
+# ====================================================================
 
 def is_junk(line: str) -> bool:
     s = line.strip()
@@ -268,31 +315,9 @@ def parse_text(text: str) -> list[dict]:
     return records
 
 
-# ------------------------------------------------------------------
+# ====================================================================
 # 4. Google スプレッドシートへの書き込み(ワイド形式: 銘柄=行, 日付=列)
-# ------------------------------------------------------------------
-
-# 対象スプレッドシートID (URLの /d/ と /edit の間の文字列)
-# 環境変数 SPREADSHEET_ID が設定されていればそちらを優先する(別スプレッドシートに切り替えたい場合用)
-SPREADSHEET_ID_DEFAULT = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
-
-# 各項目シートのgid (URLの gid= の値)
-SHEET_SPECS = [
-    # (表示名, gid, レコードのキー)
-    ("前場始値", 519462541, "am_open"),
-    ("前場高値", 1702721662, "am_high"),
-    ("前場安値", 1992276623, "am_low"),
-    ("前場終値", 1876491327, "am_close"),
-    ("後場始値", 584913773, "pm_open"),
-    ("後場高値", 1279938624, "pm_high"),
-    ("後場安値", 1826620378, "pm_low"),
-    ("後場終値", 1061743785, "pm_close"),
-    ("VWAP", 582188033, "vwap"),
-    ("出来高", 46406858, "volume"),
-]
-HEADER_ROW = ["コード", "銘柄名", "業種", "市場"]
-DATA_START_COL = 5  # E列(1-indexed)
-
+# ====================================================================
 
 def get_gspread_client():
     import gspread
@@ -378,6 +403,9 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
     n_existing_rows = len(data_rows)
 
     # 新しい列(E列)に入れる値: ヘッダー(日付) + 既存行それぞれの値(無ければ空欄)
+    # ★ ここで data_rows を1行ずつ辿り、その行のA列コード(row[0])と同じコードの
+    #    レコードを records_by_code から探して積んでいるため、既存シートの行順が
+    #    保たれたまま、コードが一致する行にだけ値が入る(ズレは発生しない)。
     col_values = [date_str]
     for row in data_rows:
         code = row[0] if row else ""
@@ -419,9 +447,6 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
     print(f"  [OK] 既存{n_existing_rows}行を更新 / 新規{len(new_rows)}行を追加")
 
 
-LOG_SHEET_TITLE = "_ProcessedDates"
-
-
 def mark_processed(spreadsheet, date_str: str, n_records: int):
     try:
         log_ws = spreadsheet.worksheet(LOG_SHEET_TITLE)
@@ -433,7 +458,7 @@ def mark_processed(spreadsheet, date_str: str, n_records: int):
 
 
 def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = False, force: bool = False):
-    date_str = target_date.strftime("%Y-%m-%d")
+    date_str = format_date_jp(target_date)
 
     if dry_run:
         print(f"[DRY-RUN] {date_str} 分、{len(records)}銘柄を各シートのE列に挿入する予定です"
@@ -460,6 +485,10 @@ def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = Fals
     mark_processed(sh, date_str, len(records))
 
 
+# ====================================================================
+# デバッグ補助
+# ====================================================================
+
 def _dump_debug_info(text: str):
     """解析失敗時に、実際に抽出されたテキストの様子をログに出して原因調査を助ける。"""
     lines = text.splitlines()
@@ -480,9 +509,9 @@ def _dump_debug_info(text: str):
         print(f"    {l!r}", file=sys.stderr)
 
 
-# ------------------------------------------------------------------
+# ====================================================================
 # main
-# ------------------------------------------------------------------
+# ====================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="JPX 東京証券取引所日報 株式相場表 取得スクリプト")
