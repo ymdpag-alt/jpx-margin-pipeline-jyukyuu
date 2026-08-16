@@ -445,7 +445,7 @@ def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = Fals
         return
 
     gc = get_gspread_client()
-    spreadsheet_id = os.environ.get("SPREADSHEET_ID", SPREADSHEET_ID_DEFAULT)
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID2", SPREADSHEET_ID_DEFAULT)
     sh = gc.open_by_key(spreadsheet_id)
 
     for name, gid, key in SHEET_SPECS:
