@@ -1,0 +1,6 @@
+nodriver
+pandas
+beautifulsoup4
+gspread
+lxml
+ 
