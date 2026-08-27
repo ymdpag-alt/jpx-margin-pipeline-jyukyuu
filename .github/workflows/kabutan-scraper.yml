@@ -1,45 +1,45 @@
 name: 株探ランキング取得
 
 on:
-  workflow_dispatch: {}   # 手動実行用（Actionsタブから「Run workflow」で即テスト可能）
+  workflow_dispatch: {}
   schedule:
-    # cronはUTC表記です。例: 平日15:30 JST（大引け後）を狙う場合 → 06:30 UTC
-    # 必要に応じて時刻・曜日を調整してください。
+    # cronはUTC表記です。平日15:30 JST（大引け後）を想定 = 06:30 UTC
     - cron: '30 6 * * 1-5'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: scripts/かぶたん
 
     steps:
-      - name: リポジトリをチェックアウト
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Python セットアップ
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: 必要なOSパッケージをインストール（Xvfb＝仮想ディスプレイ）
+      - name: Install OS packages (Xvfb)
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb fonts-liberation libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1
 
-      - name: Chrome をインストール
+      - name: Install Chrome
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Python 依存パッケージをインストール
-        run: pip install -r scripts/かぶたん/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: スクレイパーを実行
+      - name: Run kabutan ranking scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID }}
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
           HEADLESS: "false"
           # PROXY_SERVER: ${{ secrets.PROXY_SERVER }}   # 住宅用プロキシ等を使う場合はコメントアウトを外す
-        run: |
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            python "scripts/かぶたん/kabutan_scraper.py"
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" python kabutan_scraper.py
