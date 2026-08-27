@@ -41,9 +41,11 @@ CODES_SHEET_GID = 1376419996
 CODE_PATTERN = re.compile(r"^\d[0-9A-Za-z]{3}$")
 
 # 取得日付の設定 -----------------------------------------------------------
-# None のままにすると実行当日（日本時間）を自動使用
-# 日付を指定したい場合は文字列で書き換える（コメントアウトを外す）
-TARGET_DATE_OVERRIDE: str | None = None
+# GitHub Actions の「Run workflow」実行時に入力された日付（TARGET_DATE 環境変数）を
+# 優先して使用する。未入力（空文字）の場合は実行当日（日本時間）を自動使用する。
+# ローカルでコード内に直接固定したい場合は、下のコメントアウト行を有効にすればよい
+# （その場合も環境変数 TARGET_DATE が優先される点に注意）。
+TARGET_DATE_OVERRIDE: str | None = os.environ.get("TARGET_DATE") or None
 
 #　TARGET_DATE_OVERRIDE = "2026-08-25"
 
