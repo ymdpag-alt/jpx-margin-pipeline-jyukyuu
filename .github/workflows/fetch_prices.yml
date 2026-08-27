@@ -1,11 +1,14 @@
 name: 株価・出来高 取得
-
 on:
   schedule:
     # 平日 17:00 JST = 08:00 UTC（東証大引け15:30から余裕を見て設定）
     - cron: "45 7 * * 1-5"
-  workflow_dispatch: {}
-
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "取得対象日 (YYYY-MM-DD)。空欄なら当日(JST)の最新データを取得"
+        required: false
+        type: string
 jobs:
   fetch-prices:
     runs-on: ubuntu-latest
@@ -13,21 +16,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r scripts/prices/requirements.txt
-
       - name: サービスアカウントキーをファイルに復元
         working-directory: scripts/prices
         run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
       - name: 株価・出来高データを取得してスプレッドシートに書き込み
         working-directory: scripts/prices
         run: python fetch_yfinance_prices.py
+        env:
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
