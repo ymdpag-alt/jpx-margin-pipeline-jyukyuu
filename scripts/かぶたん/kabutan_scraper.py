@@ -47,9 +47,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT_KEY_PATH = os.path.join(BASE_DIR, "service_account.json")
 
 # データを書き込むスプレッドシートのID（Variablesで上書き可能）
-SPREADSHEET_ID = os.environ.get(
-    "SPREADSHEET_ID", "1QheVVw97DnHjdymEYNFwvgiQhgX8SX-bPxjlHmZpG2I"
-)
+# 注意: GitHub Actionsでは未設定の vars.SPREADSHEET_ID が空文字列として渡ってくるため、
+# os.environ.get(key, default) の default は効きません（キー自体は存在するため）。
+# 「or」で空文字列も弾いてデフォルトにフォールバックさせています。
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID") or "1QheVVw97DnHjdymEYNFwvgiQhgX8SX-bPxjlHmZpG2I"
 
 # ブラウザ関連の環境変数
 HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
@@ -376,7 +377,8 @@ async def main():
         nodriver_ver = version("nodriver")
     except PackageNotFoundError:
         nodriver_ver = "不明"
-    print(f"===== 環境情報 =====\nnodriver : {nodriver_ver}\nheadless : {HEADLESS}\n====================\n")
+    print(f"===== 環境情報 =====\nnodriver : {nodriver_ver}\nheadless : {HEADLESS}\n"
+          f"SPREADSHEET_ID : {SPREADSHEET_ID}\n====================\n")
 
     gc = get_gspread_client()
     spreadsheet = None
