@@ -1,35 +1,50 @@
-name: JPX信用取引週末残高 取得
+# .github/workflows/margin_daily.yml
+name: Margin balance daily
 
 on:
   schedule:
-    # 毎週火曜 17:20 JST = 09:00 UTC（公表は16:30目安なので余裕を見て設定）
-    - cron: "20 8 * * 2"
+    # 平日 18:07 JST（JPXの公表は16:00目安。遅延に備えて余裕を持たせる）
+    - cron: "7 9 * * 1-5"
   workflow_dispatch:
     inputs:
-      target_date:
-        description: "対象申込日 YYYYMMDD（空欄なら直近金曜を自動計算）"
+      extra_dates:
+        description: "掲載から外れた過去日を取得（例: 20260925,20260928）"
+        required: false
+        default: ""
+      inspect_date:
+        description: "レイアウト確認だけしたい日付（例: 20261005）。指定時はシートに書かない"
         required: false
         default: ""
 
 jobs:
-  fetch-margin-data:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    concurrency:
+      group: margin-daily
+      cancel-in-progress: false
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r scripts/requirements.txt
+        run: pip install "gspread>=6" pdfplumber pandas openpyxl google-auth requests
 
-      - name: Fetch JPX margin data and update spreadsheet
+      - name: Inspect PDF layout
+        if: ${{ github.event.inputs.inspect_date != '' }}
+        run: python margin_balance_to_sheets.py --inspect "${{ github.event.inputs.inspect_date }}"
+
+      - name: Update sheets
+        if: ${{ github.event.inputs.inspect_date == '' }}
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          TARGET_DATE_OVERRIDE: ${{ github.event.inputs.target_date }}
-        run: python scripts/fetch_jpx_margin.py
+          KASHIKABU_SPREADSHEET_ID: ${{ secrets.KASHIKABU_SPREADSHEET_ID }}
+          MARGIN_BACKFILL_N: "5"
+          MARGIN_EXTRA_DATES: ${{ github.event.inputs.extra_dates }}
+          MAX_DATE_COLS: "260"   # 約1年分。0にすると削除しない
+          JSDA_BACKFILL_N: "2"
+        run: python margin_balance_to_sheets.py
