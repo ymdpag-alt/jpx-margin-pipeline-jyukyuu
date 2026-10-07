@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from urllib.parse import urljoin
 
@@ -34,6 +35,8 @@ import pandas as pd
 import pdfplumber
 import requests
 from google.oauth2.service_account import Credentials
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # #############################################################################
@@ -128,10 +131,16 @@ IDX = {
     "制度信用買残高": 12,
 }
 
-STOCK_LINE_PATTERN = re.compile(
+STOCK_LINE_PATTERN = re.compile(          # 方式A: 1行にすべて並んでいる場合
     r"^(?P<prefix>.*?)\s*(?P<code>[0-9A-Z]{5})\s+"
     r"(?P<isin>[A-Z]{2}[A-Z0-9]{9}[0-9])\s+株数\s*(?:Shs\.?)?\s*(?P<body>.*)$"
 )
+# 方式B: 銘柄名・コード・数値の高さが微妙にずれて別の行に分かれる場合は、
+#        「株数」の文字の座標を基準に、同じ銘柄の部品を位置で集め直す。
+ISIN_PATTERN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")
+CODE_PATTERN = re.compile(r"^[0-9A-Z]{5}$")
+WORD_X_TOLERANCE = 1.5                     # 文字を単語にまとめる横方向の許容幅（pt）
+DEFAULT_ROW_GAP_RATIO = 2.2                # 「金額」行が見つからないときの行間（文字高さの倍率）
 VALUE_TOKEN_PATTERN = re.compile(          # ▲=減少 / 0.1%・*=上場比
     r"([▲△])?\s*(\d[\d,]*\.\d+%|\d[\d,]*%|\d[\d,]*|\*)"
 )
@@ -158,6 +167,10 @@ SUBTOTAL_CODE_PREFIX = "SUB_"
 # -----------------------------------------------------------------------------
 HTTP_TIMEOUT_PAGE = 30
 HTTP_TIMEOUT_FILE = 60
+HTTP_RETRY_TOTAL = 5                 # 429・5xx のときの再試行回数
+HTTP_RETRY_BACKOFF = 5               # 再試行の待ち時間の基準（秒）。5, 10, 20, ... と伸びる
+DOWNLOAD_INTERVAL_JPX = 2            # ファイル取得ごとの待ち時間（秒）
+DOWNLOAD_INTERVAL_JSDA = 10          # 日証協は間隔を空けないと 429 になりやすい
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -208,8 +221,18 @@ def parse_date_list(raw: str) -> list[str]:
 
 
 def http_session() -> requests.Session:
+    """429・5xx は Retry-After に従って自動で再試行するセッション。"""
+    retry = Retry(
+        total=HTTP_RETRY_TOTAL,
+        backoff_factor=HTTP_RETRY_BACKOFF,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
     sess = requests.Session()
     sess.headers.update(HTTP_HEADERS)
+    sess.mount("https://", HTTPAdapter(max_retries=retry))
     return sess
 
 
@@ -317,6 +340,99 @@ def parse_stock_line(line: str) -> tuple[dict | None, str | None]:
     return record, None
 
 
+def _failure_code(text: str) -> str | None:
+    """失敗の記録から4桁の銘柄コードを取り出す（ISINの直前の5桁、無ければ最初の5桁）。"""
+    m = re.search(r"\b([0-9A-Z]{5})\s+[A-Z]{2}[A-Z0-9]{9}[0-9]\b", text) or re.search(r"\b([0-9A-Z]{5})\b", text)
+    return m.group(1)[:4] if m else None
+
+
+def _mid(word: dict) -> float:
+    return (word["top"] + word["bottom"]) / 2
+
+
+def parse_stock_words(page) -> tuple[list[dict], list[tuple[str, str]]]:
+    """
+    方式B: 単語の座標から銘柄を組み立てる。
+
+      ┌ 銘柄名・市場・貸借 ┐┌ コード ISIN ┐┌ 株数 Shs. 9,500 100 0.1% ... ┐  ← 株数の行
+      └ 英語名 ...        ┘└            ┘└ 金額 Val. ...                ┘  ← 金額の行
+
+    「株数」を起点に、
+      - 数値     : 同じ高さで右側にある単語
+      - ISIN/コード: 左側で、株数の行〜金額の行の高さにある単語
+      - 銘柄名   : コードより左で、株数の行の高さにある単語
+    を集める。ISINが見つからない「株数」（＝合計行）は対象外。
+    """
+    words = page.extract_words(x_tolerance=WORD_X_TOLERANCE, keep_blank_chars=False)
+    anchors = [w for w in words if "株数" in w["text"]]
+    val_rows = [w for w in words if "金額" in w["text"]]
+
+    records: list[dict] = []
+    failures: list[tuple[str, str]] = []
+
+    for a in anchors:
+        a_mid = _mid(a)
+        height = a["bottom"] - a["top"]
+
+        # 行間 = この「株数」から直下の「金額」までの距離
+        below = [v["top"] - a["top"] for v in val_rows if v["top"] > a["top"] + height * 0.5]
+        gap = min(below, default=height * DEFAULT_ROW_GAP_RATIO)
+        gap = min(gap, height * 4)
+        half = gap / 2
+
+        # ---- ISIN（左側・株数の行〜金額の行）----
+        isins = [
+            w for w in words
+            if ISIN_PATTERN.fullmatch(w["text"])
+            and w["x1"] <= a["x0"] + 1
+            and a_mid - half <= _mid(w) <= a_mid + gap + half * 0.5
+        ]
+        if not isins:
+            continue  # 合計行など
+        isin = min(isins, key=lambda w: (abs(_mid(w) - a_mid), a["x0"] - w["x1"]))
+
+        # ---- コード（ISINのすぐ左）----
+        codes = [
+            w for w in words
+            if CODE_PATTERN.match(w["text"])
+            and w["x1"] <= isin["x0"] + 1
+            and abs(_mid(w) - _mid(isin)) <= half
+        ]
+        if not codes:
+            failures.append(("コードが見つかりません", isin["text"]))
+            continue
+        code = max(codes, key=lambda w: w["x1"])
+
+        # ---- 数値（同じ高さ・右側）----
+        head = re.sub(r"^.*?株数\s*(?:Shs\.?)?", "", a["text"])
+        right = sorted(
+            (w for w in words if w["x0"] >= a["x1"] - 0.5 and abs(_mid(w) - a_mid) <= half * 0.8),
+            key=lambda w: w["x0"],
+        )
+        body = " ".join([head] + [w["text"] for w in right if not w["text"].startswith("Shs")])
+        values = parse_values(body)
+        if len(values) < N_VALUES:
+            failures.append((f"数値が{len(values)}個しかありません", f"{code['text']} {body[:80]}"))
+            continue
+        values = values[:N_VALUES]
+        if not is_consistent(values):
+            failures.append(("合計≠一般＋制度（列ずれの可能性）", f"{code['text']} {body[:80]}"))
+            continue
+
+        # ---- 銘柄名（コードより左・株数の行の高さ）----
+        name_words = sorted(
+            (w for w in words if w["x1"] <= code["x0"] + 0.5 and abs(_mid(w) - a_mid) <= half),
+            key=lambda w: (round(w["top"]), w["x0"]),
+        )
+        records.append({
+            "銘柄コード": code["text"][:4],
+            "銘柄名": clean_name(" ".join(w["text"] for w in name_words)),
+            **pick_balances(values),
+        })
+
+    return records, failures
+
+
 def label_subtotal(prefix: str, state: dict) -> str | None:
     """小計・合計行のラベルを行の文字とカテゴリの流れから決める。"""
     if "総合計" in prefix:
@@ -366,18 +482,22 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     列: 銘柄コード, 銘柄名, 一般信用買残高, 一般信用売残高, 制度信用買残高, 制度信用売残高
     小計・合計行は銘柄コード "SUB_<ラベル>" として先頭に置く。
     """
-    records: list[dict] = []
+    records: dict[str, dict] = {}                 # 銘柄コード → レコード
     subtotals: dict[str, list[float]] = {}
     failures: list[tuple[str, str]] = []
     state = {"category": None, "passed_total": False}
+    n_line, n_word = 0, 0
+    sample_lines: list[str] = []                  # 読めなかったときの調査用
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         n_pages = len(pdf.pages)
         for page in pdf.pages:
+            # ---- 方式A: 1行単位 ＋ 合計行 ----
             for line in (page.extract_text() or "").split("\n"):
                 record, reason = parse_stock_line(line)
                 if record:
-                    records.append(record)
+                    records.setdefault(record["銘柄コード"], record)
+                    n_line += 1
                 elif reason:
                     failures.append((reason, line))
                 elif sub := parse_subtotal_line(line, state):
@@ -385,18 +505,37 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                     if label in subtotals:
                         print(f"  警告: 合計行 '{label}' が重複。後の値で上書きします")
                     subtotals[label] = values
+                elif len(sample_lines) < 8 and ("株数" in line or ISIN_PATTERN.search(line)):
+                    sample_lines.append(line)
+
+            # ---- 方式B: 座標で組み立て（方式Aで読めなかった銘柄を補う）----
+            word_records, word_failures = parse_stock_words(page)
+            for record in word_records:
+                if record["銘柄コード"] not in records:
+                    records[record["銘柄コード"]] = record
+                    n_word += 1
+            failures += word_failures
+
+    # どちらかの方式で読めた銘柄の失敗は数えない
+    failures = [(reason, text) for reason, text in failures if _failure_code(text) not in records]
 
     # ---- 結果のチェック ----
-    print(f"  {n_pages}ページ / {len(records)}銘柄 / 失敗 {len(failures)}行 / 合計行 {len(subtotals)}件")
+    print(
+        f"  {n_pages}ページ / {len(records)}銘柄（1行方式 {n_line}・座標方式 {n_word}）"
+        f" / 失敗 {len(failures)}件 / 合計行 {len(subtotals)}件"
+    )
     for reason, line in failures[:5]:
         print(f"    失敗例（{reason}）: {line[:120]!r}")
     if not records:
+        print("  読めなかった行の例:")
+        for line in sample_lines:
+            print(f"    {line[:160]!r}")
         raise ValueError("銘柄データを1件も読めませんでした。PDFのレイアウトが変わった可能性があります。")
     if len(failures) > max(MAX_PARSE_FAILURES, len(records) * MAX_PARSE_FAILURE_RATIO):
         raise ValueError(f"読み取り失敗が多すぎます（{len(failures)}行）。PDFのレイアウトが変わった可能性があります。")
 
     # ---- DataFrame にまとめる（合計行 → 銘柄コード順）----
-    stocks = pd.DataFrame(records).drop_duplicates(subset="銘柄コード")
+    stocks = pd.DataFrame(list(records.values()))
     stocks["_sort"] = "1_" + stocks["銘柄コード"]
 
     rows = [
@@ -692,7 +831,9 @@ def update_margin(gc: gspread.Client) -> bool:
     print(f"  取得対象: {targets}")
 
     # ---- 1日ずつ取得して4シートへ ----
-    for yyyymmdd in targets:
+    for i, yyyymmdd in enumerate(targets):
+        if i:
+            time.sleep(DOWNLOAD_INTERVAL_JPX)
         print(f"\n[{yyyymmdd}] {to_japanese_date(yyyymmdd)}")
         url = listed.get(yyyymmdd) or JPX_PDF_URL_TEMPLATE.format(date=yyyymmdd)
         try:
@@ -731,7 +872,9 @@ def update_kashikabu(gc: gspread.Client) -> None:
         return
     print(f"  取得対象: {targets}")
 
-    for yyyymmdd in targets:
+    for i, yyyymmdd in enumerate(targets):
+        if i:
+            time.sleep(DOWNLOAD_INTERVAL_JSDA)
         print(f"\n[{yyyymmdd}] {to_japanese_date(yyyymmdd)}")
         try:
             df = parse_kashikabu_xlsx(fetch_file(sess, JSDA_FILE_URL_TEMPLATE.format(date=yyyymmdd)))
