@@ -1,10 +1,8 @@
-# .github/workflows/margin_daily.yml
-name: Margin balance daily
+name: 信用残・貸株残の日次更新
 
 on:
   schedule:
-    # 平日 18:07 JST（JPXの公表は16:00目安。遅延に備えて余裕を持たせる）
-    - cron: "7 9 * * 1-5"
+    - cron: "7 9 * * 1-5"        # 平日 18:07 JST（JPXの公表は16:00目安）
   workflow_dispatch:
     inputs:
       extra_dates:
@@ -12,32 +10,34 @@ on:
         required: false
         default: ""
       inspect_date:
-        description: "レイアウト確認だけしたい日付（例: 20261005）。指定時はシートに書かない"
+        description: "PDFの読み取り確認だけ行う日付（例: 20261005）。指定時はシートに書かない"
         required: false
         default: ""
 
+concurrency:
+  group: margin-daily
+  cancel-in-progress: false
+
 jobs:
-  run:
+  update:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    concurrency:
-      group: margin-daily
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install dependencies
-        run: pip install "gspread>=6" pdfplumber pandas openpyxl google-auth requests
+      - name: 依存ライブラリのインストール
+        run: pip install -r requirements.txt
 
-      - name: Inspect PDF layout
+      - name: PDFの読み取り確認（inspect_date 指定時のみ）
         if: ${{ github.event.inputs.inspect_date != '' }}
         run: python margin_balance_to_sheets.py --inspect "${{ github.event.inputs.inspect_date }}"
 
-      - name: Update sheets
+      - name: シート更新
         if: ${{ github.event.inputs.inspect_date == '' }}
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -45,6 +45,6 @@ jobs:
           KASHIKABU_SPREADSHEET_ID: ${{ secrets.KASHIKABU_SPREADSHEET_ID }}
           MARGIN_BACKFILL_N: "5"
           MARGIN_EXTRA_DATES: ${{ github.event.inputs.extra_dates }}
-          MAX_DATE_COLS: "260"   # 約1年分。0にすると削除しない
+          MAX_DATE_COLS: "0"          # 0=削除しない。例: "260" で約1年分（既存の週次列も含めて数える）
           JSDA_BACKFILL_N: "2"
         run: python margin_balance_to_sheets.py
