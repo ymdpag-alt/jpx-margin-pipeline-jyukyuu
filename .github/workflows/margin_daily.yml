@@ -1,4 +1,4 @@
-name: 信用残・貸株残の日次更新
+name: 信用残（JPX 日次）
 
 on:
   schedule:
@@ -10,7 +10,7 @@ on:
         required: false
         default: ""
       inspect_date:
-        description: "PDFの読み取り確認だけ行う日付（例: 20261005）。指定時はシートに書かない"
+        description: "PDFの読み取り確認だけ行う日付（例: 20261006）。指定時はシートに書かない"
         required: false
         default: ""
 
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SCRIPT: scripts/margin_balance_to_sheets.py   # スクリプトの場所（リポジトリ直下からの相対パス）
+  SCRIPT: "scripts/信用残/margin_balance_to_sheets.py"
 
 jobs:
   update:
@@ -33,7 +33,7 @@ jobs:
           python-version: "3.11"
 
       - name: 依存ライブラリのインストール
-        run: pip install "gspread>=6.0" "google-auth>=2.0" "pdfplumber>=0.11" "pandas>=2.0" "openpyxl>=3.1" "requests>=2.31"
+        run: pip install "gspread>=6.0" "google-auth>=2.0" "pdfplumber>=0.11" "pandas>=2.0" "requests>=2.31"
 
       - name: PDFの読み取り確認（inspect_date 指定時のみ）
         if: ${{ github.event.inputs.inspect_date != '' }}
@@ -44,9 +44,7 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          KASHIKABU_SPREADSHEET_ID: ${{ secrets.KASHIKABU_SPREADSHEET_ID }}
           MARGIN_BACKFILL_N: "5"
           MARGIN_EXTRA_DATES: ${{ github.event.inputs.extra_dates }}
           MAX_DATE_COLS: "0"          # 0=削除しない。例: "260" で約1年分（既存の週次列も含めて数える）
-          JSDA_BACKFILL_N: "2"
         run: python "$SCRIPT"
