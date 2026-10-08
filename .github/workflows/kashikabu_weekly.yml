@@ -1,0 +1,48 @@
+name: 貸株残（日証協 週次）
+
+on:
+  schedule:
+    - cron: "13 9 * * 4,5"       # 木・金 18:13 JST（日証協は報告週の翌週木曜に公表。金曜は遅延時の再取得用）
+  workflow_dispatch:
+    inputs:
+      backfill_n:
+        description: "未取得の週を最大何週分入れるか"
+        required: false
+        default: "2"
+      inspect:
+        description: "true にすると最新xlsxの読み取り確認だけ行う（シートに書かない）"
+        required: false
+        default: "false"
+
+concurrency:
+  group: kashikabu-weekly
+  cancel-in-progress: false
+
+env:
+  SCRIPT: "scripts/貸株残/kashikabu_to_sheets.py"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 依存ライブラリのインストール
+        run: pip install "gspread>=6.0" "google-auth>=2.0" "pandas>=2.0" "openpyxl>=3.1" "requests>=2.31"
+
+      - name: xlsxの読み取り確認（inspect=true のときのみ）
+        if: ${{ github.event.inputs.inspect == 'true' }}
+        run: python "$SCRIPT" --inspect
+
+      - name: シート更新
+        if: ${{ github.event.inputs.inspect != 'true' }}
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          KASHIKABU_SPREADSHEET_ID: ${{ secrets.KASHIKABU_SPREADSHEET_ID }}
+          JSDA_BACKFILL_N: ${{ github.event.inputs.backfill_n || '2' }}
+        run: python "$SCRIPT"
