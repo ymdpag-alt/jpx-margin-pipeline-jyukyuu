@@ -236,12 +236,39 @@ def _guess_pdf_url(d: date) -> Optional[str]:
     return None
 
 
-def _links_from_browser() -> dict:
-    """方法3: Playwright(任意)でJS描画後のDOMからリンクを取得する。未インストールならスキップ。"""
+def _ensure_playwright():
+    """
+    Playwright が無ければ pip と chromium を自動インストールして sync_playwright を返す。
+    (ワークフロー側でインストール手順を足していなくても動くようにするため)
+    失敗したら None を返す。
+    """
+    import subprocess
+
     try:
         from playwright.sync_api import sync_playwright
+        return sync_playwright
     except ImportError:
-        print("  [INFO] playwright 未インストールのためブラウザ描画はスキップ", file=sys.stderr)
+        pass
+
+    print("  [INFO] playwright が未インストールのため自動インストールします...", file=sys.stderr)
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "playwright"],
+                       check=True)
+        # まずOS依存ライブラリ込みで、権限が無ければブラウザ本体のみで試す
+        r = subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
+        if r.returncode != 0:
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        from playwright.sync_api import sync_playwright
+        return sync_playwright
+    except Exception as e:
+        print(f"  [WARN] playwright の自動インストールに失敗: {e}", file=sys.stderr)
+        return None
+
+
+def _links_from_browser() -> dict:
+    """方法3: Playwright(任意)でJS描画後のDOMからリンクを取得する。未インストールならスキップ。"""
+    sync_playwright = _ensure_playwright()
+    if sync_playwright is None:
         return {}
     found = {}
     seen_urls = []
