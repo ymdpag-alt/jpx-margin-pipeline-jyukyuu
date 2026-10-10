@@ -109,6 +109,8 @@ HTTP_HEADERS = {
     "Accept-Language": "ja,en;q=0.8",
 }
 
+SCRIPT_VERSION = "貸株残 2026-10-11"   # ログの1行目に出す版番号（どの版が動いたかの確認用）
+
 WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 
 
@@ -442,6 +444,7 @@ def update(gc: gspread.Client) -> bool:
 # =============================================================================
 
 def main() -> None:
+    print(f"[版] {SCRIPT_VERSION}")
     if len(sys.argv) >= 2 and sys.argv[1] == "--inspect":
         inspect_latest()
         return
