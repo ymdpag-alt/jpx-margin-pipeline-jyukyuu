@@ -1,31 +1,22 @@
 """
-信用残：JPX「銘柄別信用取引残高」（日次） → Google スプレッドシート
+JPX 銘柄別信用取引残高（日次）＋ 日証協 貸株残（週次） → Google スプレッドシート
 
-取得元:
-    JPX 銘柄別信用取引残高  {申込日YYYYMMDD}_mtall.pdf
-    2026/9/28 から全銘柄・毎営業日16:00頃に前営業日分を公表。
-    掲載ページ（01.html）には直近5営業日分だけが載る。
+[信用残] JPX「銘柄別信用取引残高」 {申込日}_mtall.pdf
+    2026/9/28 から全銘柄・毎営業日16:00頃に前営業日分を公表（掲載ページ: margin/01.html）。
+    一般信用買／一般信用売／制度信用買／制度信用売 の4シートへ書き込む。
 
-書き込み先（SPREADSHEET_ID のブック）:
-    一般信用買残高 / 一般信用売残高 / 制度信用買残高 / 制度信用売残高 の4シート
+[貸株残] 日本証券業協会「銘柄別株券等貸借週末残高」 {申込日}z.xlsx
+    週次（報告週の翌週木曜公表）。新しいファイルが無い日は何もしない。
 
-シートの形:
-    A列=銘柄コード / B列=銘柄名 / C列以降=申込日（左ほど新しい）
+シートの形:  A列=銘柄コード / B列=銘柄名 / C列以降=申込日（左ほど新しい）
     - 新しい日付は、日付の降順が保たれる位置に1列挿入する（通常はC列）。
     - シートに無い銘柄（新規上場など）は最下部に追加する。
     - 同じ日付の列が既にあれば何もしない（何度実行しても安全）。
-    - 先頭には PDF の小計・総合計行を「SUB_～」というコードで入れる。
 
 使い方:
-    python scripts/信用残/margin_balance_to_sheets.py                    # シートを更新
-    python scripts/信用残/margin_balance_to_sheets.py --inspect 20261006 # PDFの読み取り確認だけ（書き込みなし）
-
-環境変数:
-    GOOGLE_SERVICE_ACCOUNT_JSON  サービスアカウントのJSON（必須）
-    SPREADSHEET_ID               書き込み先ブック（必須）
-    MARGIN_BACKFILL_N            掲載分のうち未取得を最大何日分入れるか（既定 5）
-    MARGIN_EXTRA_DATES           掲載から外れた過去日を直接取りに行く（例: 20260925,20260928）
-    MAX_DATE_COLS                日付列の上限。超えた分は古い順に削除（既定 0 = 削除しない）
+    python margin_balance_to_sheets.py                 # 通常実行（シートを更新）
+    python margin_balance_to_sheets.py --inspect 20261005
+                                                       # PDFの読み取り確認だけ（書き込みなし）
 """
 
 from __future__ import annotations
@@ -54,30 +45,40 @@ from urllib3.util.retry import Retry
 #
 # #############################################################################
 
+# -----------------------------------------------------------------------------
+# 1. 実行時の設定（GitHub Actions の env / secrets から受け取る）
+# -----------------------------------------------------------------------------
+GOOGLE_SERVICE_ACCOUNT_JSON_ENV = "GOOGLE_SERVICE_ACCOUNT_JSON"   # 認証JSONの環境変数名
+
 def _env(name: str, default: str = "") -> str:
     """環境変数を読む。未設定・空文字（Secrets未登録など）のときは default。"""
     return os.environ.get(name, "").strip() or default
 
 
-# -----------------------------------------------------------------------------
-# 1. 実行時の設定（GitHub Actions の env / secrets から受け取る）
-# -----------------------------------------------------------------------------
-GOOGLE_SERVICE_ACCOUNT_JSON_ENV = "GOOGLE_SERVICE_ACCOUNT_JSON"
+SPREADSHEET_ID = _env("SPREADSHEET_ID")                           # 信用残の書き込み先ブック（必須）
+KASHIKABU_SPREADSHEET_ID = _env(                                  # 貸株残の書き込み先ブック
+    "KASHIKABU_SPREADSHEET_ID", "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
+)
 
-SPREADSHEET_ID = _env("SPREADSHEET_ID")                    # 書き込み先ブック（必須）
-MARGIN_BACKFILL_N = int(_env("MARGIN_BACKFILL_N", "5"))    # 掲載分から最大何日分を埋めるか
-MARGIN_EXTRA_DATES = _env("MARGIN_EXTRA_DATES")            # 掲載外の過去日（例: 20260925,20260928）
-MAX_DATE_COLS = int(_env("MAX_DATE_COLS", "0"))            # 日付列の上限（0=削除しない）
+MARGIN_BACKFILL_N = int(_env("MARGIN_BACKFILL_N", "5"))           # 掲載分から最大何日分を埋めるか
+MARGIN_EXTRA_DATES = _env("MARGIN_EXTRA_DATES")                   # 掲載外の過去日（例: 20260925,20260928）
+TARGET_DATE_OVERRIDE = _env("TARGET_DATE_OVERRIDE")               # 1日分だけ強制取得（EXTRAと同じ扱い）
+MAX_DATE_COLS = int(_env("MAX_DATE_COLS", "0"))                   # 信用残シートの日付列の上限（0=削除しない）
+
+JSDA_ENABLED = _env("JSDA_ENABLED", "1") != "0"                   # "0" で貸株残をスキップ
+JSDA_BACKFILL_N = int(_env("JSDA_BACKFILL_N", "1"))               # 貸株残を最大何週分埋めるか
 
 # -----------------------------------------------------------------------------
 # 2. シート構成
 # -----------------------------------------------------------------------------
-SHEETS = {                   # DataFrameの列名 → 書き込み先シート名
+MARGIN_SHEETS = {            # DataFrameの列名 → 書き込み先シート名
     "一般信用買残高": "一般信用買残高",
     "一般信用売残高": "一般信用売残高",
     "制度信用買残高": "制度信用買残高",
     "制度信用売残高": "制度信用売残高",
 }
+KASHIKABU_SHEET_NAME = "貸株残"
+KASHIKABU_VALUE_COL = "貸株残"
 
 FIXED_COLS = 2               # A列=銘柄コード, B列=銘柄名
 FIRST_DATE_COL = 3           # C列（1始まり）
@@ -87,7 +88,7 @@ NEW_SHEET_ROWS = 100         # シート新規作成時の行数
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # -----------------------------------------------------------------------------
-# 3. 取得元（JPX）
+# 3. JPX（信用残）
 # -----------------------------------------------------------------------------
 JPX_LIST_URL = "https://www.jpx.co.jp/markets/statistics-equities/margin/01.html"
 JPX_PDF_URL_TEMPLATE = (     # 掲載から外れた日付を直接取りに行くとき用
@@ -97,7 +98,19 @@ JPX_PDF_URL_TEMPLATE = (     # 掲載から外れた日付を直接取りに行�
 JPX_LINK_PATTERN = re.compile(r'href="([^"]*?(\d{8})_mtall\.pdf)"')
 
 # -----------------------------------------------------------------------------
-# 4. PDF の読み取りルール
+# 4. 日証協（貸株残）
+# -----------------------------------------------------------------------------
+JSDA_INDEX_URL = "https://www.jsda.or.jp/shiryoshitsu/toukei/kabu-taiw/index.html"
+JSDA_FILE_URL_TEMPLATE = "https://www.jsda.or.jp/shiryoshitsu/toukei/kabu-taiw/files/{date}z.xlsx"
+JSDA_LINK_PATTERN = re.compile(r"files/(\d{8})z\.xlsx")
+
+JSDA_CODE_KEYWORDS = ["銘柄コード", "コード", "code"]          # 列見出しの候補（優先順）
+JSDA_NAME_KEYWORDS = ["銘柄名", "名称", "銘柄"]
+JSDA_BALANCE_KEYWORDS = ["貸付残高", "貸付", "貸株", "週末残高", "残高"]
+JSDA_BALANCE_EXCLUDE = ["借入", "返済", "新規", "成約"]
+
+# -----------------------------------------------------------------------------
+# 5. JPX PDF の読み取りルール（2026/10/5 申込分の実データで確認済み）
 # -----------------------------------------------------------------------------
 # 1銘柄は「株数」行と「金額」行の2行。株数行だけを読む。
 #   B 極洋　普通株式 プライム 貸 13010 JP3257200000 株数 Shs. 9,500 100 0.1% 161,300 1,200 1.3% ...
@@ -118,22 +131,21 @@ IDX = {
     "制度信用買残高": 12,
 }
 
-# 方式A: 銘柄名〜数値が1行にそろって取り出せる場合
-STOCK_LINE_PATTERN = re.compile(
+STOCK_LINE_PATTERN = re.compile(          # 方式A: 1行にすべて並んでいる場合
     r"^(?P<prefix>.*?)\s*(?P<code>[0-9A-Z]{5})\s+"
     r"(?P<isin>[A-Z]{2}[A-Z0-9]{9}[0-9])\s+株数\s*(?:Shs\.?)?\s*(?P<body>.*)$"
 )
-# 方式B: 高さがずれて別々の行に分かれる場合は、「株数」の座標を基準に位置で集め直す
+# 方式B: 銘柄名・コード・数値の高さが微妙にずれて別の行に分かれる場合は、
+#        「株数」の文字の座標を基準に、同じ銘柄の部品を位置で集め直す。
 ISIN_PATTERN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")
 CODE_PATTERN = re.compile(r"^[0-9A-Z]{5}$")
-WORD_X_TOLERANCE = 1.5       # 文字を単語にまとめる横方向の許容幅（pt）
-DEFAULT_ROW_GAP_RATIO = 2.2  # 「金額」行が見つからないときの行間（文字高さの倍率）
-
+WORD_X_TOLERANCE = 1.5                     # 文字を単語にまとめる横方向の許容幅（pt）
+DEFAULT_ROW_GAP_RATIO = 2.2                # 「金額」行が見つからないときの行間（文字高さの倍率）
 VALUE_TOKEN_PATTERN = re.compile(          # ▲=減少 / 0.1%・*=上場比
     r"([▲△])?\s*(\d[\d,]*\.\d+%|\d[\d,]*%|\d[\d,]*|\*)"
 )
 
-NAME_CLEANUP_PATTERNS = [    # 銘柄名から取り除く部分（上から順に適用）
+NAME_CLEANUP_PATTERNS = [                  # 銘柄名から取り除く部分（上から順に適用）
     re.compile(r"^[AJKBMCTF][\s　]+"),                               # 先頭の売買単位フラグ
     re.compile(r"[\s　]*(貸|制|他)$"),                               # 末尾の貸借区分
     re.compile(r"[\s　]*(プライム|スタンダード|グロース|投信等|ＰＲＯ|PRO|TOKYO PRO Market)$"),
@@ -141,7 +153,7 @@ NAME_CLEANUP_PATTERNS = [    # 銘柄名から取り除く部分（上から順�
                r"新株予約権証券|外国株預託証券|株式)$"),
 ]
 
-MAX_PARSE_FAILURES = 20          # 失敗がこれ（または全体の1%）を超えたらレイアウト変更とみなす
+MAX_PARSE_FAILURES = 20          # 失敗行がこれ（または全体の1%）を超えたらレイアウト変更とみなす
 MAX_PARSE_FAILURE_RATIO = 0.01
 
 # 小計・総合計行のラベル付け
@@ -151,13 +163,14 @@ SEGMENT_ORDER = ["合計", "プライム", "スタンダード", "グロース",
 SUBTOTAL_CODE_PREFIX = "SUB_"
 
 # -----------------------------------------------------------------------------
-# 5. HTTP
+# 6. HTTP
 # -----------------------------------------------------------------------------
 HTTP_TIMEOUT_PAGE = 30
 HTTP_TIMEOUT_FILE = 60
-HTTP_RETRY_TOTAL = 5             # 429・5xx のときの再試行回数
-HTTP_RETRY_BACKOFF = 5           # 再試行の待ち時間の基準（秒）。5, 10, 20, ... と伸びる
-DOWNLOAD_INTERVAL = 2            # ファイル取得ごとの待ち時間（秒）
+HTTP_RETRY_TOTAL = 5                 # 429・5xx のときの再試行回数
+HTTP_RETRY_BACKOFF = 5               # 再試行の待ち時間の基準（秒）。5, 10, 20, ... と伸びる
+DOWNLOAD_INTERVAL_JPX = 2            # ファイル取得ごとの待ち時間（秒）
+DOWNLOAD_INTERVAL_JSDA = 10          # 日証協は間隔を空けないと 429 になりやすい
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -239,6 +252,12 @@ def fetch_file(sess: requests.Session, url: str) -> bytes:
     return resp.content
 
 
+def print_title(title: str) -> None:
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
+
+
 # =============================================================================
 # JPX: 掲載一覧と PDF の取得
 # =============================================================================
@@ -252,7 +271,7 @@ def list_jpx_files(sess: requests.Session) -> dict[str, str]:
     return files
 
 
-def download_pdf(sess: requests.Session, url: str) -> bytes:
+def download_jpx_pdf(sess: requests.Session, url: str) -> bytes:
     content = fetch_file(sess, url)
     if not content.startswith(b"%PDF"):
         raise ValueError(f"PDFではない応答が返りました: {url}")
@@ -260,7 +279,7 @@ def download_pdf(sess: requests.Session, url: str) -> bytes:
 
 
 # =============================================================================
-# PDF の読み取り：数値・銘柄名
+# JPX: PDF の読み取り
 # =============================================================================
 
 def parse_values(body: str) -> list[float | None]:
@@ -287,7 +306,7 @@ def is_consistent(values: list[float | None]) -> bool:
 
 
 def pick_balances(values: list[float | None]) -> dict[str, float]:
-    return {col: values[IDX[col]] for col in SHEETS}
+    return {col: values[IDX[col]] for col in MARGIN_SHEETS}
 
 
 def clean_name(prefix: str) -> str:
@@ -296,16 +315,6 @@ def clean_name(prefix: str) -> str:
         name = pattern.sub("", name)
     return name.strip(" 　")
 
-
-def failure_code(text: str) -> str | None:
-    """失敗の記録から4桁の銘柄コードを取り出す（ISINの直前の5桁、無ければ最初の5桁）。"""
-    m = re.search(r"\b([0-9A-Z]{5})\s+[A-Z]{2}[A-Z0-9]{9}[0-9]\b", text) or re.search(r"\b([0-9A-Z]{5})\b", text)
-    return m.group(1)[:4] if m else None
-
-
-# =============================================================================
-# PDF の読み取り：方式A（1行単位）
-# =============================================================================
 
 def parse_stock_line(line: str) -> tuple[dict | None, str | None]:
     """
@@ -331,9 +340,11 @@ def parse_stock_line(line: str) -> tuple[dict | None, str | None]:
     return record, None
 
 
-# =============================================================================
-# PDF の読み取り：方式B（座標で組み立て）
-# =============================================================================
+def _failure_code(text: str) -> str | None:
+    """失敗の記録から4桁の銘柄コードを取り出す（ISINの直前の5桁、無ければ最初の5桁）。"""
+    m = re.search(r"\b([0-9A-Z]{5})\s+[A-Z]{2}[A-Z0-9]{9}[0-9]\b", text) or re.search(r"\b([0-9A-Z]{5})\b", text)
+    return m.group(1)[:4] if m else None
+
 
 def _mid(word: dict) -> float:
     return (word["top"] + word["bottom"]) / 2
@@ -341,15 +352,15 @@ def _mid(word: dict) -> float:
 
 def parse_stock_words(page) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    単語の座標から銘柄を組み立てる。
+    方式B: 単語の座標から銘柄を組み立てる。
 
       ┌ 銘柄名・市場・貸借 ┐┌ コード ISIN ┐┌ 株数 Shs. 9,500 100 0.1% ... ┐  ← 株数の行
       └ 英語名 ...        ┘└            ┘└ 金額 Val. ...                ┘  ← 金額の行
 
     「株数」を起点に、
-      - 数値       : 同じ高さで右側にある単語
-      - ISIN・コード: 左側で、株数の行〜金額の行の高さにある単語
-      - 銘柄名     : コードより左で、株数の行の高さにある単語
+      - 数値     : 同じ高さで右側にある単語
+      - ISIN/コード: 左側で、株数の行〜金額の行の高さにある単語
+      - 銘柄名   : コードより左で、株数の行の高さにある単語
     を集める。ISINが見つからない「株数」（＝合計行）は対象外。
     """
     words = page.extract_words(x_tolerance=WORD_X_TOLERANCE, keep_blank_chars=False)
@@ -365,7 +376,8 @@ def parse_stock_words(page) -> tuple[list[dict], list[tuple[str, str]]]:
 
         # 行間 = この「株数」から直下の「金額」までの距離
         below = [v["top"] - a["top"] for v in val_rows if v["top"] > a["top"] + height * 0.5]
-        gap = min(min(below, default=height * DEFAULT_ROW_GAP_RATIO), height * 4)
+        gap = min(below, default=height * DEFAULT_ROW_GAP_RATIO)
+        gap = min(gap, height * 4)
         half = gap / 2
 
         # ---- ISIN（左側・株数の行〜金額の行）----
@@ -421,12 +433,8 @@ def parse_stock_words(page) -> tuple[list[dict], list[tuple[str, str]]]:
     return records, failures
 
 
-# =============================================================================
-# PDF の読み取り：小計・総合計行
-# =============================================================================
-
 def label_subtotal(prefix: str, state: dict) -> str | None:
-    """小計・合計行のラベルを、行の文字とカテゴリの流れから決める。"""
+    """小計・合計行のラベルを行の文字とカテゴリの流れから決める。"""
     if "総合計" in prefix:
         state["passed_total"] = True
         return "総合計"
@@ -467,10 +475,6 @@ def subtotal_sort_key(label: str) -> int:
     seg = next((i for i, s in enumerate(SEGMENT_ORDER) if s in label), len(SEGMENT_ORDER))
     return cat * 10 + seg
 
-
-# =============================================================================
-# PDF の読み取り：全体
-# =============================================================================
 
 def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """
@@ -513,7 +517,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             failures += word_failures
 
     # どちらかの方式で読めた銘柄の失敗は数えない
-    failures = [(reason, text) for reason, text in failures if failure_code(text) not in records]
+    failures = [(reason, text) for reason, text in failures if _failure_code(text) not in records]
 
     # ---- 結果のチェック ----
     print(
@@ -528,7 +532,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             print(f"    {line[:160]!r}")
         raise ValueError("銘柄データを1件も読めませんでした。PDFのレイアウトが変わった可能性があります。")
     if len(failures) > max(MAX_PARSE_FAILURES, len(records) * MAX_PARSE_FAILURE_RATIO):
-        raise ValueError(f"読み取り失敗が多すぎます（{len(failures)}件）。PDFのレイアウトが変わった可能性があります。")
+        raise ValueError(f"読み取り失敗が多すぎます（{len(failures)}行）。PDFのレイアウトが変わった可能性があります。")
 
     # ---- DataFrame にまとめる（合計行 → 銘柄コード順）----
     stocks = pd.DataFrame(list(records.values()))
@@ -547,7 +551,7 @@ def parse_margin_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     return df.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
 
 
-def inspect_pdf(yyyymmdd: str) -> None:
+def inspect_margin_pdf(yyyymmdd: str) -> None:
     """--inspect 用。PDFの先頭・末尾ページと読み取り結果を表示する（書き込みなし）。"""
     sess = http_session()
     try:
@@ -555,7 +559,7 @@ def inspect_pdf(yyyymmdd: str) -> None:
     except Exception as e:
         print(f"掲載一覧を取得できませんでした: {e}")
         url = None
-    pdf_bytes = download_pdf(sess, url or JPX_PDF_URL_TEMPLATE.format(date=yyyymmdd))
+    pdf_bytes = download_jpx_pdf(sess, url or JPX_PDF_URL_TEMPLATE.format(date=yyyymmdd))
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for title, page in (("先頭ページ", pdf.pages[0]), ("末尾ページ", pdf.pages[-1])):
@@ -571,12 +575,92 @@ def inspect_pdf(yyyymmdd: str) -> None:
 
 
 # =============================================================================
+# 日証協: 貸株残の取得と読み取り
+# =============================================================================
+
+def list_jsda_dates(sess: requests.Session) -> list[str]:
+    """日証協ページに載っている申込日を新しい順で返す。"""
+    dates = sorted(set(JSDA_LINK_PATTERN.findall(fetch_text(sess, JSDA_INDEX_URL))), reverse=True)
+    if not dates:
+        raise ValueError("日証協のページにファイルリンクがありません。ページ構成が変わった可能性があります。")
+    return dates
+
+
+def normalize_stock_code(value) -> str | None:
+    """'1301' / '1301.0' / '13010' / '402A' → 4桁コード"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    s = re.sub(r"\.0$", "", str(value).strip().upper())
+    if re.fullmatch(r"[0-9A-Z]{4}0", s):
+        return s[:4]
+    if re.fullmatch(r"[0-9A-Z]{4}", s):
+        return s
+    return None
+
+
+def find_column(columns: list[str], keywords: list[str], exclude: list[str] | None = None) -> str | None:
+    for keyword in keywords:
+        for col in columns:
+            if exclude and any(ex in col for ex in exclude):
+                continue
+            if keyword in col:
+                return col
+    return None
+
+
+def parse_kashikabu_xlsx(xlsx_bytes: bytes) -> pd.DataFrame:
+    """xlsx → DataFrame（列: 銘柄コード, 銘柄名, 貸株残）"""
+    raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=0, header=None)
+
+    header_row = next(
+        (i for i in range(min(25, len(raw)))
+         if any(kw in str(v) for v in raw.iloc[i] for kw in JSDA_CODE_KEYWORDS)),
+        None,
+    )
+    if header_row is None:
+        raise ValueError("ヘッダー行が見つかりません。書式が変わった可能性があります。")
+
+    columns = [re.sub(r"[\s　]", "", str(c)) for c in raw.iloc[header_row]]
+    body = raw.iloc[header_row + 1:].copy()
+    body.columns = columns
+
+    code_col = find_column(columns, JSDA_CODE_KEYWORDS)
+    name_col = find_column(columns, JSDA_NAME_KEYWORDS)
+    value_col = find_column(columns, JSDA_BALANCE_KEYWORDS, exclude=JSDA_BALANCE_EXCLUDE)
+    if code_col is None or value_col is None:
+        raise ValueError(f"必要な列が見つかりません。検出列: {columns}")
+    print(f"  使用列: コード='{code_col}' / 残高='{value_col}' / 銘柄名='{name_col}'")
+
+    records = []
+    for _, row in body.iterrows():
+        code = normalize_stock_code(row[code_col])
+        value = pd.to_numeric(str(row[value_col]).replace(",", "").strip(), errors="coerce")
+        if code is None or pd.isna(value):
+            continue
+        name = str(row[name_col]).strip() if name_col else ""
+        records.append({
+            "銘柄コード": code,
+            "銘柄名": "" if name in ("nan", "None") else name,
+            KASHIKABU_VALUE_COL: float(value),
+        })
+
+    if not records:
+        raise ValueError("貸株残データを読めませんでした。書式が変わった可能性があります。")
+    print(f"  {len(records)}銘柄")
+
+    df = pd.DataFrame(records).groupby("銘柄コード", as_index=False).agg(
+        {"銘柄名": "first", KASHIKABU_VALUE_COL: "sum"}
+    )
+    return df.sort_values("銘柄コード").reset_index(drop=True)
+
+
+# =============================================================================
 # Google Sheets: 接続とユーティリティ
 # =============================================================================
 
 def connect_google_sheets() -> gspread.Client:
     """サービスアカウントで認証する。429（レート制限）は自動リトライ。"""
-    raw = os.environ.get(GOOGLE_SERVICE_ACCOUNT_JSON_ENV, "")
+    raw = os.environ[GOOGLE_SERVICE_ACCOUNT_JSON_ENV]
     try:
         info = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -601,7 +685,7 @@ def open_worksheet(gc: gspread.Client, spreadsheet_id: str, sheet_name: str) -> 
 
 
 def ensure_size(ws: gspread.Worksheet, rows: int = 0, cols: int = 0) -> None:
-    """行数・列数が足りなければ広げる。"""
+    """行数・列数が足りなければ広げる（gspread 6.x では手元の ws を直接広げる）。"""
     if cols and ws.col_count < cols:
         ws.add_cols(cols - ws.col_count)
     if rows and ws.row_count < rows:
@@ -709,23 +793,21 @@ def write_date_column(
 
 
 # =============================================================================
-# 更新処理
+# ジョブ1: 信用残（JPX 日次）
 # =============================================================================
 
-def done_dates(gc: gspread.Client) -> set[str]:
+def margin_done_dates(gc: gspread.Client) -> set[str]:
     """4シートすべてに入っている日付（途中で失敗した日は未完了として扱う）"""
     per_sheet = [
         dates_in_header(open_worksheet(gc, SPREADSHEET_ID, name).row_values(1))
-        for name in SHEETS.values()
+        for name in MARGIN_SHEETS.values()
     ]
     return set.intersection(*per_sheet)
 
 
-def update(gc: gspread.Client) -> bool:
-    """戻り値: 問題なければ True"""
-    print("=" * 60)
-    print("信用取引残高（JPX 日次）")
-    print("=" * 60)
+def update_margin(gc: gspread.Client) -> bool:
+    """戻り値: 問題なければ True（False のとき main は終了コード1で終える）"""
+    print_title("信用取引残高（JPX 日次）")
     sess = http_session()
     ok = True
 
@@ -737,8 +819,8 @@ def update(gc: gspread.Client) -> bool:
         print(f"  ✗ 掲載一覧の取得に失敗: {e}")
         listed, ok = {}, False
 
-    extra = parse_date_list(MARGIN_EXTRA_DATES)
-    done = done_dates(gc)
+    extra = parse_date_list(MARGIN_EXTRA_DATES) + parse_date_list(TARGET_DATE_OVERRIDE)
+    done = margin_done_dates(gc)
     print(f"  シートの最新: {max((d for d in done if is_yyyymmdd(d)), default='なし')}")
 
     targets = sorted((d for d in listed if d not in done), reverse=True)[:MARGIN_BACKFILL_N]
@@ -751,11 +833,11 @@ def update(gc: gspread.Client) -> bool:
     # ---- 1日ずつ取得して4シートへ ----
     for i, yyyymmdd in enumerate(targets):
         if i:
-            time.sleep(DOWNLOAD_INTERVAL)
+            time.sleep(DOWNLOAD_INTERVAL_JPX)
         print(f"\n[{yyyymmdd}] {to_japanese_date(yyyymmdd)}")
         url = listed.get(yyyymmdd) or JPX_PDF_URL_TEMPLATE.format(date=yyyymmdd)
         try:
-            df = parse_margin_pdf(download_pdf(sess, url))
+            df = parse_margin_pdf(download_jpx_pdf(sess, url))
         except FileNotFoundError as e:
             print(f"  ✗ {e}")
             ok = ok and yyyymmdd not in listed   # 掲載外の過去日が消えているのは想定内
@@ -765,10 +847,41 @@ def update(gc: gspread.Client) -> bool:
             ok = False
             continue
 
-        for value_col, sheet_name in SHEETS.items():
+        for value_col, sheet_name in MARGIN_SHEETS.items():
             write_date_column(gc, SPREADSHEET_ID, sheet_name, df, value_col, yyyymmdd, MAX_DATE_COLS)
 
     return ok
+
+
+# =============================================================================
+# ジョブ2: 貸株残（日証協 週次）
+# =============================================================================
+
+def update_kashikabu(gc: gspread.Client) -> None:
+    print_title("貸株残（日本証券業協会）")
+    sess = http_session()
+
+    available = list_jsda_dates(sess)
+    print(f"  掲載中: {available[:5]}{' ...' if len(available) > 5 else ''}")
+
+    ws = open_worksheet(gc, KASHIKABU_SPREADSHEET_ID, KASHIKABU_SHEET_NAME)
+    done = dates_in_header(ws.row_values(1))
+    targets = sorted(sorted((d for d in available if d not in done), reverse=True)[:JSDA_BACKFILL_N])
+    if not targets:
+        print("  新しいデータはありません")
+        return
+    print(f"  取得対象: {targets}")
+
+    for i, yyyymmdd in enumerate(targets):
+        if i:
+            time.sleep(DOWNLOAD_INTERVAL_JSDA)
+        print(f"\n[{yyyymmdd}] {to_japanese_date(yyyymmdd)}")
+        try:
+            df = parse_kashikabu_xlsx(fetch_file(sess, JSDA_FILE_URL_TEMPLATE.format(date=yyyymmdd)))
+        except Exception as e:
+            print(f"  ✗ 取得/読み取りに失敗: {e}")
+            continue
+        write_date_column(gc, KASHIKABU_SPREADSHEET_ID, KASHIKABU_SHEET_NAME, df, KASHIKABU_VALUE_COL, yyyymmdd)
 
 
 # =============================================================================
@@ -777,13 +890,29 @@ def update(gc: gspread.Client) -> bool:
 
 def main() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "--inspect":
-        inspect_pdf(sys.argv[2])
+        inspect_margin_pdf(sys.argv[2])
         return
 
     if not SPREADSHEET_ID:
         sys.exit("エラー: 環境変数 SPREADSHEET_ID が設定されていません")
 
-    if not update(connect_google_sheets()):
+    gc = connect_google_sheets()
+
+    try:
+        margin_ok = update_margin(gc)
+    except Exception as e:
+        print(f"✗ 信用残の処理で予期しないエラー: {e}")
+        margin_ok = False
+
+    if JSDA_ENABLED:
+        try:
+            update_kashikabu(gc)          # 信用残の成否に関係なく実行
+        except Exception as e:
+            print(f"警告: 貸株残の処理に失敗しました: {e}")
+    else:
+        print("\n貸株残はスキップ（JSDA_ENABLED=0）")
+
+    if not margin_ok:
         sys.exit("\n信用残の取得に失敗した日があります。ログを確認してください。")
 
 
