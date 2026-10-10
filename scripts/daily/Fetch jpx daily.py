@@ -47,7 +47,7 @@ import requests
 # ====================================================================
 
 # --- JPX 日報 index ページ -------------------------------------------------
-JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/00-archives-01.html"
+JPX_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/daily/index.html"
 
 # --- 日付表示フォーマット用 -------------------------------------------------
 # date.weekday(): 月=0, 火=1, 水=2, 木=3, 金=4, 土=5, 日=6
@@ -439,46 +439,60 @@ def is_junk(line: str) -> bool:
     return False
 
 
-_NUM_TOKEN_RE = re.compile(r'^' + NUM + r'$')
-_CODE_UNIT_RE = re.compile(r'^' + CODE_RE_STR + r'\s+\d+\s+\S')
+# 数値 または「－」(その場で売買なし/特殊気配なし)。全角数字(２２５など)を数値と誤認しないよう ASCII のみ。
+_NUMD = r'(?:[0-9,]+(?:\.[0-9]+)?|-[0-9,]+(?:\.[0-9]+)?|[－ー―])'
+_NUMD_RE = re.compile(r'^' + _NUMD + r'$')
+
+# 「コード [マーク] 売買単位 銘柄名…」で始まる行。
+# マークは D / N / W / V / # など1文字で、コードと売買単位の間に入ることがある
+# (2026-09-29 のPDFでは約5,000行に付いており、これを想定していなかったため大量に取りこぼしていた)。
+_ROW_HEAD_RE = re.compile(r'^(' + CODE_RE_STR + r')\s+(?:([A-Za-z#＃])\s+)?(\d+)\s+\S')
+
+_DATA_KEYS = ["am_open", "am_high", "am_low", "am_close",
+              "pm_open", "pm_high", "pm_low", "pm_close",
+              "final_quote", "net_change", "vwap", "volume", "value"]
+
+# 内国株式以外のセクション見出し(空白除去後の先頭一致)。INCLUDE_NON_STOCK_SECTIONS=False ならこれ以降の行は対象外
+NON_STOCK_SECTION_PREFIXES = (
+    "出資証券", "内国投資信託受益証券", "内国投資証券", "外国投信受益証券", "外国投資証券",
+)
+STOCK_SECTION_HEADS = {"内国株式", "外国株式"}
+STOCK_SECTION_HEADS_EN = {"DomesticStock", "ForeignStock"}
+# ETF・ETN・REIT・出資証券などもシートに載せたい場合は True にする(業種・市場は空欄になる)
+INCLUDE_NON_STOCK_SECTIONS = False
 
 
-def _looks_like_data_line(s: str) -> bool:
-    """「コード 売買単位 銘柄名 …」で始まり、数値が多数並ぶ行ならデータ行とみなす。"""
-    if not _CODE_UNIT_RE.match(s):
-        return False
-    return sum(1 for t in s.split() if _NUM_TOKEN_RE.match(t)) >= 8
-
-
-def _parse_data_line_loose(s: str) -> Optional[dict]:
+def _parse_data_line(s: str) -> Optional[dict]:
     """
-    厳密な正規表現に合わないデータ行(英文社名が同じ行に混ざった等)の救済用。
-    先頭3トークン(コード/単位/和文銘柄名)以降から数値トークンだけを順に拾う。
-    英単語は数値ではないため自然に除外され、英文社名として別途まとめる。
-    数値は 前場OHLC(4)+後場OHLC(4)+[最終気配]+前日比+VWAP+出来高+売買代金 の並びを想定する。
+    データ行を右端の13個の数値(または「－」)から逆算して解析する。
+        前場OHLC(4) + 後場OHLC(4) + 最終気配 + 前日比 + VWAP + 出来高 + 売買代金
+    左側の「コード [マーク] 売買単位」の後ろ、数値より前の部分を和文銘柄名とする。
+    こうすると、銘柄名に空白が含まれていても(例: "ＴＳＩ ＨＤ")、片方の場が売買なしで
+    「－ － － －」になっていても、同じように解析できる。
     """
-    s = re.sub(r'([－ー―])(?=\d)', r'\1 ', s)  # 「－30.00」のような連結を分離
-    toks = s.split()
-    if len(toks) < 3:
+    m = _ROW_HEAD_RE.match(s)
+    if not m:
         return None
-    code, unit, name_jp = toks[0], toks[1], toks[2]
-    nums, words = [], []
-    for t in toks[3:]:
-        if _NUM_TOKEN_RE.match(t) or t.startswith("-") and _NUM_TOKEN_RE.match(t[1:]):
-            nums.append(t)
-        elif t in ("－", "ー", "―"):
-            nums.append(t)
-        else:
-            words.append(t)
-    # 最終気配が「－」(特殊気配なし)の場合は1トークン分ある。数値だけなら13個、気配が無ければ12個ではなく
-    # 常に13個(気配欄は「－」または数値)になる想定。
-    if len(nums) != 13:
+    code, flag, unit = m.group(1), m.group(2), m.group(3)
+    toks = re.sub(r'([－ー―])(?=[0-9])', r'\1 ', s).split()  # 「－30.00」のような連結を分離
+    head = 3 if flag else 2  # コード, [マーク], 売買単位
+    if len(toks) < head + 1 + 13:
         return None
-    keys = ["am_open", "am_high", "am_low", "am_close",
-            "pm_open", "pm_high", "pm_low", "pm_close",
-            "final_quote", "net_change", "vwap", "volume", "value"]
-    rec = {"code": code, "unit": unit, "name_jp": name_jp, "name_en": " ".join(words)}
-    rec.update(dict(zip(keys, nums)))
+
+    tail = toks[-13:]
+    if all(_NUMD_RE.match(t) for t in tail):
+        name_jp, name_en = " ".join(toks[head:-13]), ""
+    else:
+        # 英文社名が同じ行に混ざった場合の救済: 数値トークンだけ順に拾い、残りを社名とみなす
+        rest = toks[head:]
+        nums = [t for t in rest if _NUMD_RE.match(t)]
+        words = [t for t in rest if not _NUMD_RE.match(t)]
+        if len(nums) != 13 or not words:
+            return None
+        tail, name_jp, name_en = nums, words[0], " ".join(words[1:])
+
+    rec = {"code": code, "unit": unit, "flag": flag or "", "name_jp": name_jp, "name_en": name_en}
+    rec.update(dict(zip(_DATA_KEYS, tail)))
     return rec
 
 
@@ -487,75 +501,88 @@ def parse_text(text: str) -> list[dict]:
     PDFから抽出したテキストを解析し、銘柄ごとのレコード(dict)のリストを返す。
 
     実際のPDFのレイアウトは、1銘柄につき以下の2行で構成される:
-        1行目: コード 売買単位 銘柄名(和文) 前場OHLC 後場OHLC 最終気配 前日比 VWAP 出来高 売買代金
+        1行目: コード [マーク] 売買単位 銘柄名(和文) 前場OHLC 後場OHLC 最終気配 前日比 VWAP 出来高 売買代金
         2行目: 銘柄名(英文)
 
     その手前に出現する「業種」「市場」見出し行を状態として保持し、各レコードに付与する。
+    PDFには通常取引のあとにPTS等の別表も続くが、数値が少ないためデータ行とは見なさず読み飛ばす。
     """
     lines = text.splitlines()
     content = [l for l in lines if not is_junk(l)]
 
     current_market = None
     current_industry = None
-    pending_record = None  # データ行はマッチしたが、まだ英文社名行を待っている状態
+    in_stock_section = True  # 内国株式のセクション内か
+    pending_record = None  # データ行は解析できたが、まだ英文社名行を待っている状態
 
     records = []
-
-    unparsed = []  # コード行らしいのに解析できなかった行(取りこぼし調査用)
+    unparsed = []  # 通常取引の行のはずなのに解析できなかった行(取りこぼし調査用)
+    n_skipped_non_stock = 0
 
     for raw in content:
         s = raw.strip()
 
-        dm = DATA_LINE_RE.match(s)
-        rec = None
-        if dm:
-            rec = dm.groupdict()
-        elif _looks_like_data_line(s):
-            # 英文社名の行が数値行と同じ高さに重なって1行に混ざった場合などは、
-            # 厳密な正規表現に合わない。数値トークンだけを順に拾う緩い解析で救済する。
-            rec = _parse_data_line_loose(s)
-            if rec is None:
-                unparsed.append(s)
-                continue  # 業種見出しと誤認しないよう、ここで読み飛ばす
+        is_row = _ROW_HEAD_RE.match(s) is not None
+        rec = _parse_data_line(s) if is_row else None
 
         if pending_record is not None:
-            if rec is not None:
-                # 英文社名行が欠けて、次の銘柄のデータ行が来た場合。
-                # (従来は次の銘柄を「英文社名」として食ってしまい、銘柄が丸ごと欠落していた)
-                pending_record["name_en"] = ""
+            if is_row:
+                # 英文社名行が欠けて、次の銘柄の行が来た場合(次の銘柄を英文社名として食わない)
                 records.append(pending_record)
                 pending_record = None
             else:
-                # 直前のデータ行の次に来る行は英文社名(そのまま採用)
                 pending_record["name_en"] = s
                 records.append(pending_record)
                 pending_record = None
                 continue
 
-        if rec is not None:
-            rec["industry"] = current_industry
-            rec["market"] = current_market
-            if rec.get("name_en"):  # 緩い解析で社名が取れていれば英文行の待機は不要
+        if is_row:
+            if rec is None:
+                # 数値が多いのに解析できない行だけ警告(PTSなど数値の少ない別表の行は黙って除外)
+                # (通常取引の行は数値が13個、PTSの行は6個。コード・売買単位を除いた数で判定)
+                if in_stock_section and sum(1 for t in s.split()[2:] if _NUMD_RE.match(t)) >= 10:
+                    unparsed.append(s)
+                continue
+            if not in_stock_section and not INCLUDE_NON_STOCK_SECTIONS:
+                n_skipped_non_stock += 1
+                continue
+            if in_stock_section:
+                rec["industry"] = current_industry
+                rec["market"] = current_market
+            else:
+                rec["industry"] = ""
+                rec["market"] = ""
+            if rec["name_en"]:
                 records.append(rec)
             else:
                 pending_record = rec
             continue
 
-        # ここに来るのは「業種見出し」または「市場見出し」等のセクション行
+        # ここに来るのは「業種見出し」「市場見出し」等のセクション行(または英文社名行)
+        compact = re.sub(r'\s+', '', s)
         if s in MARKET_HEADERS:
             current_market = s.replace("市場", "")
-        elif s in NON_INDUSTRY_OTHER_LINES:
-            pass  # 市場の英語表記など、業種欄には転記しない
-        else:
+            in_stock_section = True
+        elif compact in STOCK_SECTION_HEADS:
+            in_stock_section = True
+        elif compact in STOCK_SECTION_HEADS_EN or s in NON_INDUSTRY_OTHER_LINES:
+            pass  # 英語表記など、業種欄には転記しない
+        elif compact.startswith(NON_STOCK_SECTION_PREFIXES):
+            in_stock_section = False
+        elif in_stock_section:
             # 業種見出しは "水産・農林業 Fishery,Agriculture & Forestry" のように
             # 和文+英文が空白区切りで並んでいるため、和文部分(先頭トークン)のみを採用する
             current_industry = s.split()[0] if s.split() else s
 
     if unparsed:
-        print(f"  [WARN] コード行らしいのに解析できなかった行が {len(unparsed)} 件あります"
+        print(f"  [WARN] 通常取引の行のはずなのに解析できなかった行が {len(unparsed)} 件あります"
               "(先頭20件を表示):", file=sys.stderr)
         for l in unparsed[:20]:
             print(f"    {l!r}", file=sys.stderr)
+
+    if n_skipped_non_stock:
+        print(f"  [INFO] 内国株式以外(ETF・REIT・出資証券等)の {n_skipped_non_stock} 行は対象外として除外しました",
+              file=sys.stderr)
 
     if pending_record is not None:
         # 最終行がデータ行で終わっていて英文社名行が取得できなかった場合
@@ -596,6 +623,8 @@ def format_value(metric_key: str, raw: str) -> str:
     シートに書き込む直前の値の整形。
     出来高(volume)は千株単位で抽出しているため、実株数(×1000)に変換する。
     """
+    if raw in ("－", "ー", "―"):
+        return ""  # その場で売買なし(「－」)は空欄にする。全角ダッシュの文字列を数値列に入れない
     if metric_key == "volume" and raw:
         try:
             v = float(raw.replace(",", "")) * 1000
@@ -625,6 +654,20 @@ def ensure_header(ws, all_values: list[list[str]]) -> list[list[str]]:
     return all_values
 
 
+_HEADER_DATE_RE = re.compile(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日')
+
+
+def parse_header_date(s: str) -> Optional[date]:
+    """ヘッダーセルの「2026年9月29日(火)」形式から date を取り出す(日付でなければ None)。"""
+    m = _HEADER_DATE_RE.search(s or "")
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
 def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, force: bool = False):
     """
     1つの項目シート(ワイド形式)を更新する。
@@ -640,12 +683,28 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
     data_rows = all_values[1:]
 
     # 既に同じ日付列が存在する場合は二重挿入を避ける
-    existing_col = None  # 既に同じ日付列がある場合の列番号(1-indexed)
-    if date_str in header:
+    target_d = parse_header_date(date_str)
+    cur_cols = ws.col_count  # 現在のシート列数(列削除に合わせて自分で更新する)
+    # 同じ日付の列(重複していても全部)の列番号(0-indexed)。ヘッダーの曜日表記ゆれは日付で照合する。
+    same_date_cols = [i for i in range(DATA_START_COL - 1, len(header))
+                      if parse_header_date(header[i]) == target_d]
+    if same_date_cols:
         if not force:
-            print(f"  [SKIP] 既に {date_str} 列が存在するため挿入をスキップします(--force で上書き修復可)")
+            print(f"  [SKIP] 既に {date_str} 列が存在するため挿入をスキップします(--force で作り直し可)")
             return
-        existing_col = header.index(date_str) + 1
+        # --force: 同じ日付の列(重複含む)をいったん全部削除し、正しい日付順の位置に入れ直す。
+        # (従来は --force のたびに E列へ新しい列が挿入され、重複列や日付順の乱れが発生していた)
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "deleteDimension": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                              "startIndex": i, "endIndex": i + 1}
+                }
+            } for i in sorted(same_date_cols, reverse=True)]  # 右から消してズレを防ぐ
+        })
+        print(f"  [INFO] 既存の {date_str} 列 {len(same_date_cols)} 本を削除して作り直します")
+        header = [h for i, h in enumerate(header) if i not in set(same_date_cols)]
+        cur_cols -= len(same_date_cols)
 
     code_to_rowidx = {}
     for idx, row in enumerate(data_rows):
@@ -665,25 +724,30 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
         rec = records_by_code.get(code)
         col_values.append(format_value(metric_key, rec[metric_key]) if rec else "")
 
-    if existing_col is None:
-        # Step1: E列の前に空列を1つ挿入(既存の日付列は右にずれる)
+    # Step1: 日付の新しい順(左ほど新しい)になるよう、挿入位置を決めて空列を1つ入れる。
+    # 通常の日次実行では最新日なので E列。過去日のバックフィルは該当する位置に入る。
+    target_col = DATA_START_COL
+    for i in range(DATA_START_COL - 1, len(header)):
+        hd = parse_header_date(header[i])
+        if hd is None or (target_d is not None and hd < target_d):
+            break
+        target_col = i + 2  # 1-indexed で「この列の右隣」
+    if target_col <= cur_cols:
         ws.spreadsheet.batch_update({
             "requests": [{
                 "insertDimension": {
                     "range": {
                         "sheetId": ws.id,
                         "dimension": "COLUMNS",
-                        "startIndex": DATA_START_COL - 1,
-                        "endIndex": DATA_START_COL,
+                        "startIndex": target_col - 1,
+                        "endIndex": target_col,
                     },
                     "inheritFromBefore": False,
                 }
             }]
         })
-        target_col = DATA_START_COL
     else:
-        # --force かつ同じ日付列が既にある場合: 列は挿入せず、その列を上書きして修復する
-        target_col = existing_col
+        ws.add_cols(target_col - cur_cols)  # シートの右端に追加する場合
 
     # Step2: 対象列に日付+各行の値をまとめて書き込み
     end_row = 1 + n_existing_rows
