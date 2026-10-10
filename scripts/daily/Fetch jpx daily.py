@@ -333,6 +333,13 @@ def find_pdf_url(target_date: Optional[date] = None) -> tuple[str, date]:
             return links[d], d
         if target_date in links:
             return links[target_date], target_date
+        # 一覧(当月分のみ等)に無い過去日は、見つかったリンクのURLの型から組み立てて試す
+        sample_d = max(links)
+        sample_ymd = sample_d.strftime("%Y%m%d")
+        PDF_URL_TEMPLATES.insert(0, links[sample_d].replace(sample_ymd, "{ymd}"))
+        url = _guess_pdf_url(target_date)
+        if url:
+            return url, target_date
         raise RuntimeError(f"指定日 {target_date} の株式相場表PDFが見つかりませんでした"
                            "(休場日、まだ掲載されていない、または一覧の表示範囲外の可能性があります)。")
 
@@ -432,6 +439,49 @@ def is_junk(line: str) -> bool:
     return False
 
 
+_NUM_TOKEN_RE = re.compile(r'^' + NUM + r'$')
+_CODE_UNIT_RE = re.compile(r'^' + CODE_RE_STR + r'\s+\d+\s+\S')
+
+
+def _looks_like_data_line(s: str) -> bool:
+    """「コード 売買単位 銘柄名 …」で始まり、数値が多数並ぶ行ならデータ行とみなす。"""
+    if not _CODE_UNIT_RE.match(s):
+        return False
+    return sum(1 for t in s.split() if _NUM_TOKEN_RE.match(t)) >= 8
+
+
+def _parse_data_line_loose(s: str) -> Optional[dict]:
+    """
+    厳密な正規表現に合わないデータ行(英文社名が同じ行に混ざった等)の救済用。
+    先頭3トークン(コード/単位/和文銘柄名)以降から数値トークンだけを順に拾う。
+    英単語は数値ではないため自然に除外され、英文社名として別途まとめる。
+    数値は 前場OHLC(4)+後場OHLC(4)+[最終気配]+前日比+VWAP+出来高+売買代金 の並びを想定する。
+    """
+    s = re.sub(r'([－ー―])(?=\d)', r'\1 ', s)  # 「－30.00」のような連結を分離
+    toks = s.split()
+    if len(toks) < 3:
+        return None
+    code, unit, name_jp = toks[0], toks[1], toks[2]
+    nums, words = [], []
+    for t in toks[3:]:
+        if _NUM_TOKEN_RE.match(t) or t.startswith("-") and _NUM_TOKEN_RE.match(t[1:]):
+            nums.append(t)
+        elif t in ("－", "ー", "―"):
+            nums.append(t)
+        else:
+            words.append(t)
+    # 最終気配が「－」(特殊気配なし)の場合は1トークン分ある。数値だけなら13個、気配が無ければ12個ではなく
+    # 常に13個(気配欄は「－」または数値)になる想定。
+    if len(nums) != 13:
+        return None
+    keys = ["am_open", "am_high", "am_low", "am_close",
+            "pm_open", "pm_high", "pm_low", "pm_close",
+            "final_quote", "net_change", "vwap", "volume", "value"]
+    rec = {"code": code, "unit": unit, "name_jp": name_jp, "name_en": " ".join(words)}
+    rec.update(dict(zip(keys, nums)))
+    return rec
+
+
 def parse_text(text: str) -> list[dict]:
     """
     PDFから抽出したテキストを解析し、銘柄ごとのレコード(dict)のリストを返す。
@@ -451,22 +501,44 @@ def parse_text(text: str) -> list[dict]:
 
     records = []
 
+    unparsed = []  # コード行らしいのに解析できなかった行(取りこぼし調査用)
+
     for raw in content:
         s = raw.strip()
 
-        if pending_record is not None:
-            # 直前のデータ行の次に来る行は英文社名(そのまま採用)
-            pending_record["name_en"] = s
-            records.append(pending_record)
-            pending_record = None
-            continue
-
         dm = DATA_LINE_RE.match(s)
+        rec = None
         if dm:
             rec = dm.groupdict()
+        elif _looks_like_data_line(s):
+            # 英文社名の行が数値行と同じ高さに重なって1行に混ざった場合などは、
+            # 厳密な正規表現に合わない。数値トークンだけを順に拾う緩い解析で救済する。
+            rec = _parse_data_line_loose(s)
+            if rec is None:
+                unparsed.append(s)
+                continue  # 業種見出しと誤認しないよう、ここで読み飛ばす
+
+        if pending_record is not None:
+            if rec is not None:
+                # 英文社名行が欠けて、次の銘柄のデータ行が来た場合。
+                # (従来は次の銘柄を「英文社名」として食ってしまい、銘柄が丸ごと欠落していた)
+                pending_record["name_en"] = ""
+                records.append(pending_record)
+                pending_record = None
+            else:
+                # 直前のデータ行の次に来る行は英文社名(そのまま採用)
+                pending_record["name_en"] = s
+                records.append(pending_record)
+                pending_record = None
+                continue
+
+        if rec is not None:
             rec["industry"] = current_industry
             rec["market"] = current_market
-            pending_record = rec
+            if rec.get("name_en"):  # 緩い解析で社名が取れていれば英文行の待機は不要
+                records.append(rec)
+            else:
+                pending_record = rec
             continue
 
         # ここに来るのは「業種見出し」または「市場見出し」等のセクション行
@@ -478,6 +550,12 @@ def parse_text(text: str) -> list[dict]:
             # 業種見出しは "水産・農林業 Fishery,Agriculture & Forestry" のように
             # 和文+英文が空白区切りで並んでいるため、和文部分(先頭トークン)のみを採用する
             current_industry = s.split()[0] if s.split() else s
+
+    if unparsed:
+        print(f"  [WARN] コード行らしいのに解析できなかった行が {len(unparsed)} 件あります"
+              "(先頭20件を表示):", file=sys.stderr)
+        for l in unparsed[:20]:
+            print(f"    {l!r}", file=sys.stderr)
 
     if pending_record is not None:
         # 最終行がデータ行で終わっていて英文社名行が取得できなかった場合
@@ -562,9 +640,12 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
     data_rows = all_values[1:]
 
     # 既に同じ日付列が存在する場合は二重挿入を避ける
-    if not force and date_str in header:
-        print(f"  [SKIP] 既に {date_str} 列が存在するため挿入をスキップします(--force で強制上書き可)")
-        return
+    existing_col = None  # 既に同じ日付列がある場合の列番号(1-indexed)
+    if date_str in header:
+        if not force:
+            print(f"  [SKIP] 既に {date_str} 列が存在するため挿入をスキップします(--force で上書き修復可)")
+            return
+        existing_col = header.index(date_str) + 1
 
     code_to_rowidx = {}
     for idx, row in enumerate(data_rows):
@@ -584,24 +665,29 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
         rec = records_by_code.get(code)
         col_values.append(format_value(metric_key, rec[metric_key]) if rec else "")
 
-    # Step1: E列の前に空列を1つ挿入(既存の日付列は右にずれる)
-    ws.spreadsheet.batch_update({
-        "requests": [{
-            "insertDimension": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": DATA_START_COL - 1,
-                    "endIndex": DATA_START_COL,
-                },
-                "inheritFromBefore": False,
-            }
-        }]
-    })
+    if existing_col is None:
+        # Step1: E列の前に空列を1つ挿入(既存の日付列は右にずれる)
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "insertDimension": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": DATA_START_COL - 1,
+                        "endIndex": DATA_START_COL,
+                    },
+                    "inheritFromBefore": False,
+                }
+            }]
+        })
+        target_col = DATA_START_COL
+    else:
+        # --force かつ同じ日付列が既にある場合: 列は挿入せず、その列を上書きして修復する
+        target_col = existing_col
 
-    # Step2: 挿入した列(E列)に日付+各行の値をまとめて書き込み
+    # Step2: 対象列に日付+各行の値をまとめて書き込み
     end_row = 1 + n_existing_rows
-    col = col_letter(DATA_START_COL)
+    col = col_letter(target_col)
     ws.update(f"{col}1:{col}{end_row}", [[v] for v in col_values],
               value_input_option="USER_ENTERED")
 
@@ -611,6 +697,7 @@ def update_wide_sheet(ws, date_str: str, records: list[dict], metric_key: str, f
         if r["code"] not in code_to_rowidx:
             new_rows.append([
                 r["code"], r["name_jp"], r["industry"] or "", r["market"] or "",
+            ] + [""] * (target_col - DATA_START_COL) + [
                 format_value(metric_key, r[metric_key]),
             ])
     if new_rows:
@@ -629,6 +716,24 @@ def mark_processed(spreadsheet, date_str: str, n_records: int):
                        value_input_option="USER_ENTERED")
 
 
+COUNT_DROP_TOLERANCE = 0.97  # 前回件数のこの割合を下回ったら異常とみなす
+
+
+def _last_processed_count(spreadsheet) -> Optional[int]:
+    """_ProcessedDates シートの最終行の件数を返す(無ければ None)。"""
+    try:
+        rows = spreadsheet.worksheet(LOG_SHEET_TITLE).get_all_values()
+    except Exception:
+        return None
+    for row in reversed(rows[1:]):
+        if len(row) >= 2:
+            try:
+                return int(str(row[1]).replace(",", ""))
+            except ValueError:
+                continue
+    return None
+
+
 def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = False, force: bool = False):
     date_str = format_date_jp(target_date)
 
@@ -644,6 +749,15 @@ def write_to_sheets(records: list[dict], target_date: date, dry_run: bool = Fals
     gc = get_gspread_client()
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", SPREADSHEET_ID_DEFAULT)
     sh = gc.open_by_key(spreadsheet_id)
+
+    # 取りこぼし防止: 直近の処理件数より大きく減っていたら、シートを壊さないよう書き込み前に止める
+    prev = _last_processed_count(sh)
+    if prev and len(records) < prev * COUNT_DROP_TOLERANCE:
+        msg = (f"抽出件数 {len(records)} が前回処理分 {prev} を大きく下回っています"
+               f"(許容: {COUNT_DROP_TOLERANCE:.0%} 以上)。PDF解析の取りこぼしの可能性があります。")
+        if not force:
+            raise RuntimeError(msg + " 内容を確認のうえ、問題なければ --force で再実行してください。")
+        print(f"  [WARN] {msg} --force 指定のため続行します。", file=sys.stderr)
 
     for name, gid, key in SHEET_SPECS:
         print(f"[{name}] 更新中...")
