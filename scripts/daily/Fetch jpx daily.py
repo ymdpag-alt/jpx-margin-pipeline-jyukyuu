@@ -148,41 +148,163 @@ def format_date_jp(d: date) -> str:
 # 1. JPXサイトから最新(または指定日)の「株式相場表」PDFリンクを取得
 # ====================================================================
 
+JPX_HOST = "https://www.jpx.co.jp"
+
+# JPXサイトは python-requests の既定UAだと別内容を返す/弾くことがあるため、ブラウザ相当のヘッダーを付ける
+HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept-Language": "ja,en;q=0.8",
+}
+
+STQ_RE = re.compile(r"""(?P<path>[^\s"'<>()]*stq_(?P<ymd>\d{8})\.pdf)""")
+
+# 一覧がJS描画になったため、PDFの置き場所を直接推測するときの候補(上から順に試す)
+PDF_URL_TEMPLATES = [
+    JPX_HOST + "/markets/statistics-equities/daily/stq_{ymd}.pdf",
+    JPX_HOST + "/automation/markets/statistics-equities/daily/stq_{ymd}.pdf",
+    JPX_HOST + "/markets/statistics-equities/daily/pdf/stq_{ymd}.pdf",
+]
+
+
+def _abs_url(path: str, base: str = JPX_INDEX_URL) -> str:
+    from urllib.parse import urljoin
+    return urljoin(base, path)
+
+
+def _collect_stq_links(text: str, base: str = JPX_INDEX_URL) -> dict:
+    """テキスト(HTML/JS/JSON問わず)から stq_YYYYMMDD.pdf を全部拾い {date: url} で返す。"""
+    found = {}
+    for m in STQ_RE.finditer(text.replace("\\/", "/")):
+        try:
+            d = datetime.strptime(m.group("ymd"), "%Y%m%d").date()
+        except ValueError:
+            continue
+        found.setdefault(d, _abs_url(m.group("path"), base))
+    return found
+
+
+def _links_from_static_html() -> dict:
+    """方法1: 静的HTML本文 + そこから参照されるJS/JSONファイルを調べる。"""
+    resp = requests.get(JPX_INDEX_URL, headers=HTTP_HEADERS, timeout=30)
+    resp.raise_for_status()
+    html = resp.text
+
+    found = _collect_stq_links(html)
+    if found:
+        return found
+
+    # 一覧がJSで後から描画されている場合、データ元(js/json)に日付一覧が入っていることが多い
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    refs = [s["src"] for s in soup.find_all("script", src=True)]
+    refs += re.findall(r"""["']([^"']+\.(?:json|js)(?:\?[^"']*)?)["']""", html)
+    seen = set()
+    for ref in refs:
+        url = _abs_url(ref)
+        if url in seen or "googletagmanager" in url or "facebook" in url:
+            continue
+        seen.add(url)
+        try:
+            r = requests.get(url, headers=HTTP_HEADERS, timeout=30)
+            if r.ok:
+                found.update(_collect_stq_links(r.text, url))
+        except requests.RequestException:
+            continue
+        if found:
+            break
+    return found
+
+
+def _url_exists(url: str) -> bool:
+    try:
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=30, stream=True)
+        ok = r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower()
+        r.close()
+        return ok
+    except requests.RequestException:
+        return False
+
+
+def _guess_pdf_url(d: date) -> Optional[str]:
+    """方法2: 日付からPDFのURLを直接組み立てて存在確認する。"""
+    ymd = d.strftime("%Y%m%d")
+    for tmpl in PDF_URL_TEMPLATES:
+        url = tmpl.format(ymd=ymd)
+        if _url_exists(url):
+            return url
+    return None
+
+
+def _links_from_browser() -> dict:
+    """方法3: Playwright(任意)でJS描画後のDOMからリンクを取得する。未インストールならスキップ。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {}
+    found = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(user_agent=HTTP_HEADERS["User-Agent"])
+        page.goto(JPX_INDEX_URL, wait_until="networkidle", timeout=60000)
+        hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+        browser.close()
+    found.update(_collect_stq_links("\n".join(hrefs)))
+    return found
+
+
 def find_pdf_url(target_date: Optional[date] = None) -> tuple[str, date]:
     """
-    JPX日報indexページをスクレイピングし、株式相場表(stq_YYYYMMDD.pdf)へのリンクを取得する。
-    target_date を指定した場合はその日付の行を探す。指定しない場合は一覧の最初(最新)を返す。
+    株式相場表(stq_YYYYMMDD.pdf)のURLを取得する。
+    日報indexページの一覧がJavaScript描画になり、静的HTMLにリンクが無くなったため、
+      1. 静的HTML/参照JS・JSON内のリンク
+      2. 日付からのURL直接推測(最新日指定の場合は直近の平日を遡って探索)
+      3. Playwrightによるブラウザ描画(インストールされている場合のみ)
+    の順に試す。target_date 未指定なら最新日を返す。
     """
-    from bs4 import BeautifulSoup
+    # --- 方法1 ---
+    try:
+        links = _links_from_static_html()
+    except requests.RequestException as e:
+        print(f"  [WARN] indexページ取得に失敗: {e}", file=sys.stderr)
+        links = {}
 
-    resp = requests.get(JPX_INDEX_URL, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # --- 方法3(方法1が空のときだけ。方法2より先に試して実際の一覧を優先) ---
+    if not links:
+        try:
+            links = _links_from_browser()
+        except Exception as e:  # playwrightの起動失敗などは致命的にしない
+            print(f"  [WARN] ブラウザ描画での取得に失敗: {e}", file=sys.stderr)
+            links = {}
 
-    ymd_re = re.compile(r"stq_(\d{8})\.pdf")
-    candidates = []
-    for a in soup.find_all("a", href=True):
-        m = ymd_re.search(a["href"])
-        if m:
-            d = datetime.strptime(m.group(1), "%Y%m%d").date()
-            url = a["href"] if a["href"].startswith("http") else "https://www.jpx.co.jp" + a["href"]
-            candidates.append((d, url))
+    if links:
+        if target_date is None:
+            d = max(links)
+            return links[d], d
+        if target_date in links:
+            return links[target_date], target_date
+        raise RuntimeError(f"指定日 {target_date} の株式相場表PDFが見つかりませんでした"
+                           "(休場日、まだ掲載されていない、または一覧の表示範囲外の可能性があります)。")
 
-    if not candidates:
-        raise RuntimeError("JPX日報indexページから株式相場表PDFリンクを検出できませんでした。"
-                            "サイト構造が変更された可能性があります。")
+    # --- 方法2: URL直接推測 ---
+    print("  [INFO] 一覧からリンクを取得できないため、URLを直接推測します", file=sys.stderr)
+    if target_date is not None:
+        url = _guess_pdf_url(target_date)
+        if url:
+            return url, target_date
+    else:
+        from datetime import timedelta
+        d = datetime.now().date()
+        for _ in range(10):  # 直近10日(土日・祝日を飛ばす分)を遡る
+            if d.weekday() < 5:
+                url = _guess_pdf_url(d)
+                if url:
+                    return url, d
+            d -= timedelta(days=1)
 
-    candidates.sort(key=lambda x: x[0], reverse=True)  # 新しい日付順
-
-    if target_date is None:
-        return candidates[0][1], candidates[0][0]
-
-    for d, url in candidates:
-        if d == target_date:
-            return url, d
-
-    raise RuntimeError(f"指定日 {target_date} の株式相場表PDFが見つかりませんでした"
-                        "(休場日、まだ掲載されていない、または一覧の表示範囲外の可能性があります)。")
+    raise RuntimeError("株式相場表PDFのURLを取得できませんでした。"
+                       "JPXの一覧はJS描画のため、PDF_URL_TEMPLATES を実際のURLに合わせるか、"
+                       "Playwright(pip install playwright && playwright install chromium)を導入してください。")
 
 
 # ====================================================================
@@ -190,7 +312,7 @@ def find_pdf_url(target_date: Optional[date] = None) -> tuple[str, date]:
 # ====================================================================
 
 def download_pdf(url: str) -> bytes:
-    resp = requests.get(url, timeout=60)
+    resp = requests.get(url, headers=HTTP_HEADERS, timeout=60)
     resp.raise_for_status()
     return resp.content
 
