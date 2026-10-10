@@ -241,15 +241,38 @@ def _links_from_browser() -> dict:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
+        print("  [INFO] playwright 未インストールのためブラウザ描画はスキップ", file=sys.stderr)
         return {}
     found = {}
+    seen_urls = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(user_agent=HTTP_HEADERS["User-Agent"])
+        page = browser.new_page(user_agent=HTTP_HEADERS["User-Agent"], locale="ja-JP")
+
+        def on_response(resp):
+            # 一覧データをXHR/JSONで取得している場合に備え、通信内容からもリンクを拾う
+            try:
+                seen_urls.append(resp.url)
+                ctype = resp.headers.get("content-type", "").lower()
+                if any(k in ctype for k in ("json", "javascript", "html", "text")):
+                    found.update(_collect_stq_links(resp.text(), resp.url))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
         page.goto(JPX_INDEX_URL, wait_until="networkidle", timeout=60000)
+        try:
+            page.wait_for_selector("a[href*='stq_']", timeout=15000)
+        except Exception:
+            pass
         hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
         browser.close()
     found.update(_collect_stq_links("\n".join(hrefs)))
+    if not found:
+        print("  [DEBUG] ブラウザ描画でもstqリンクなし。ページが読み込んだjpx.co.jp内URL:", file=sys.stderr)
+        for u in seen_urls:
+            if "jpx.co.jp" in u:
+                print(f"    {u}", file=sys.stderr)
     return found
 
 
