@@ -26,7 +26,7 @@ from google.oauth2.service_account import Credentials
 # 定数
 # ============================================================
 JPX_BASE = "https://www.jpx.co.jp"
-JPX_PAGE_URL = f"{JPX_BASE}/markets/statistics-equities/margin/01.html"
+JPX_PAGE_URL = f"{JPX_BASE}/markets/statistics-equities/margin/02.html"
 
 # スプレッドシートID（環境変数 SPREADSHEET_ID があればそちらを優先）
 DEFAULT_SPREADSHEET_ID = "1kWST0CkkIvo3irPSbMgtVtUqqRDXFwvRREYZDRQAFMY"
