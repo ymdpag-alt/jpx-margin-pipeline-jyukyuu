@@ -14,6 +14,12 @@
 #    (3) Chromeのパス・プロキシ・headless切替を環境変数で指定可能に
 #    (4) CAPTCHA発生時や認証失敗時は exit code 1 で終了し、
 #        GitHub Actions側で失敗として検知できるようにしました
+#    (5) 【今回の修正】root実行で "Failed to connect to browser" となる問題への対処
+#        - uc.start() に sandbox=False を明示（nodriverの専用引数）
+#          ※ browser_args に --no-sandbox を入れるだけでは不十分
+#        - 引数名がバージョン差で異なる場合に備え、no_sandbox=True へフォールバック
+#        - --disable-gpu を追加（Xvfb配下での不安定さ対策）
+#        - user_data_dir を実行ごとの一時ディレクトリにして、前回プロセスとの競合を回避
 #
 #  必要なリポジトリ設定：
 #    - Secrets: GOOGLE_SERVICE_ACCOUNT_JSON
@@ -28,8 +34,10 @@ import os
 import sys
 import json
 import time
+import shutil
 import asyncio
 import random
+import tempfile
 from io import StringIO
 from importlib.metadata import version, PackageNotFoundError
 
@@ -219,6 +227,27 @@ async def warm_up(browser, max_wait=30):
 
 
 # ============================================================
+#  ブラウザ起動（root実行・Actions環境対応）
+# ============================================================
+async def start_browser(browser_args, user_data_dir):
+    """
+    nodriver の sandbox 無効化引数は版によって名前が異なる
+    （新: sandbox=False / 旧: no_sandbox=True）ため、順に試す。
+    """
+    common = dict(
+        headless=HEADLESS,                       # Actionsでは既定でFalse（Xvfb配下）
+        browser_executable_path=CHROME_PATH,
+        browser_args=browser_args,
+        user_data_dir=user_data_dir,
+    )
+    try:
+        return await uc.start(sandbox=False, **common)
+    except TypeError as e:
+        print(f"  [起動] sandbox 引数が使えないため no_sandbox にフォールバック: {e}", flush=True)
+        return await uc.start(no_sandbox=True, **common)
+
+
+# ============================================================
 #  メイン巡回処理（GitHub Actions：Xvfb上でheadless=Falseとして動作）
 # ============================================================
 async def scrape_all(targets):
@@ -227,18 +256,18 @@ async def scrape_all(targets):
         "--lang=ja-JP",
         "--accept-lang=ja-JP,ja",
         "--window-size=1920,1080",
-        # GitHub Actionsのコンテナ的な実行環境向け（root実行・共有メモリ対策）
+        # GitHub Actionsのコンテナ的な実行環境向け（root実行・共有メモリ・GPU対策）
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
     ]
     if PROXY_SERVER:
         browser_args.append(f"--proxy-server={PROXY_SERVER}")
 
-    browser = await uc.start(
-        headless=HEADLESS,              # Actionsでは既定でFalse（Xvfb配下で実Chrome相当として動かす）
-        browser_executable_path=CHROME_PATH,
-        browser_args=browser_args,
-    )
+    # 実行ごとに新しいプロファイルを使い、前回プロセスの残骸との競合を避ける
+    user_data_dir = tempfile.mkdtemp(prefix="kabutan_chrome_")
+
+    browser = await start_browser(browser_args, user_data_dir)
 
     results = {}
     captcha_hit = False
@@ -294,6 +323,7 @@ async def scrape_all(targets):
                 await stop
         except Exception as e:
             print(f"ブラウザ終了エラー: {e}")
+        shutil.rmtree(user_data_dir, ignore_errors=True)
         print("ブラウザを終了しました。")
 
     if captcha_hit:
