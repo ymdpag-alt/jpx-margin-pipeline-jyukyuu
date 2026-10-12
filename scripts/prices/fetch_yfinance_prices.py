@@ -1,14 +1,45 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import time
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fetch_yfinance_prices.py  —  JPX全銘柄の OHLCV を Google スプレッドシートへ書き込む
+
+【旧版からの主な変更】
+1. 営業日カレンダーを yfinance(7203.T) から取得し、休場日・土日・大引け前の当日は
+   最初から対象外にする（空の日付列を作らない / 朝の実行で全滅しない）。
+2. 実行のたびに「直近 BACKFILL_DAYS 日」を対象にし、既存の日付列であっても
+   "空セルだけ" を補完する。過去に取りこぼした日が次回実行で自動的に埋まる。
+   （旧版は見出しに日付があるだけで「追加なし」と判定していたため、
+     見出しだけ存在して中身が空の列は永久に埋まらなかった）
+3. 見出しとデータを同じ batch_update に入れて書く（見出しだけ残る事故を防ぐ）。
+4. 取得率の判定を日付ごとに行う（1日ダメでも他の日は書き込む）。
+5. 日付列がすでに新しい順なら、全面書き直し（ソート）をスキップ。
+6. 休場日にできた空の日付列を掃除するオプション（CLEAN_HOLIDAY_COLUMNS=1）。
+7. Sheets API の 429/5xx は自動リトライ。
+
+【環境変数】
+  TARGET_DATE          空=自動 / "2026-10-09" / "2026-10-06,2026-10-09" / "2026-10-01:2026-10-09"
+  BACKFILL_DAYS        自動モードで遡るカレンダー日数（既定 14）
+  MARKET_CLOSE_HHMM    この時刻より前は当日を対象外にする（既定 16:00）
+  FORCE_INTRADAY       1 で大引け前でも当日を対象にする（場中の暫定値が入るので非推奨）
+  CLEAN_HOLIDAY_COLUMNS 1 で、休場日の「完全に空の」日付列を削除する
+  CHUNK_SIZE / SLEEP_TIME / MAX_ATTEMPTS / BACKOFF_BASE / MAX_CODES / MIN_FILL_RATE
+  ABORT_AFTER_EMPTY_CHUNKS / SERVICE_ACCOUNT_FILE
+"""
+
+from __future__ import annotations
+
 import os
-import re
 import random
+import re
 import sys
-import gspread
-from datetime import datetime
+import time
+from datetime import date, datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
+
+import gspread
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 # =============================================================================
 # 定数定義
@@ -17,76 +48,63 @@ from zoneinfo import ZoneInfo
 SPREADSHEET_ID = "1QheVVw97DnHjdymEYNFwvgiQhgX8SX-bPxjlHmZpG2I"
 
 # ---- 各データ種別ごとのタブ (gid) --------------------------------------------
-OPEN_SHEET_GID   = 1348359438    # 始値
-HIGH_SHEET_GID   = 13194030      # 高値
-LOW_SHEET_GID    = 876490713     # 安値
-CLOSE_SHEET_GID  = 2080765326    # 終値
-VOLUME_SHEET_GID = 328764273     # 出来高
+OPEN_SHEET_GID = 1348359438    # 始値
+HIGH_SHEET_GID = 13194030      # 高値
+LOW_SHEET_GID = 876490713      # 安値
+CLOSE_SHEET_GID = 2080765326   # 終値
+VOLUME_SHEET_GID = 328764273   # 出来高
 
-# yfinance のフィールド名 → (書き込み先gid, 日本語ラベル, ログ見出し)
 FIELD_CONFIG = {
-    "Open":   {"gid": OPEN_SHEET_GID,   "label_jp": "始値", "heading": "【始値データ】"},
-    "High":   {"gid": HIGH_SHEET_GID,   "label_jp": "高値", "heading": "【高値データ】"},
-    "Low":    {"gid": LOW_SHEET_GID,    "label_jp": "安値", "heading": "【安値データ】"},
-    "Close":  {"gid": CLOSE_SHEET_GID,  "label_jp": "終値", "heading": "【終値データ】"},
+    "Open":   {"gid": OPEN_SHEET_GID,   "label_jp": "始値",   "heading": "【始値データ】"},
+    "High":   {"gid": HIGH_SHEET_GID,   "label_jp": "高値",   "heading": "【高値データ】"},
+    "Low":    {"gid": LOW_SHEET_GID,    "label_jp": "安値",   "heading": "【安値データ】"},
+    "Close":  {"gid": CLOSE_SHEET_GID,  "label_jp": "終値",   "heading": "【終値データ】"},
     "Volume": {"gid": VOLUME_SHEET_GID, "label_jp": "出来高", "heading": "【出来高データ】"},
 }
-# 取得・書き込みを行うフィールド一覧（この順で処理される）
 FIELDS = ["Open", "High", "Low", "Close", "Volume"]
 
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
 
 CODES_SHEET_GID = 1376419996
-
 CODE_PATTERN = re.compile(r"^\d[0-9A-Za-z]{3}$")
 
-# 取得日付の設定 -----------------------------------------------------------
-# GitHub Actions の「Run workflow」実行時に入力された日付（TARGET_DATE 環境変数）を
-# 優先して使用する。未入力（空文字）の場合は実行当日（日本時間）を自動使用する。
-# ローカルでコード内に直接固定したい場合は、下のコメントアウト行を有効にすればよい
-# （その場合も環境変数 TARGET_DATE が優先される点に注意）。
-TARGET_DATE_OVERRIDE: str | None = os.environ.get("TARGET_DATE") or None
+# 先頭の固定列（A:銘柄コード, B:備考/銘柄名）
+FIXED_COLS = 2
+FIXED_HEADERS = ["銘柄コード", "備考"]
 
-#　TARGET_DATE_OVERRIDE = "2026-08-25"
-
-TARGET_DATES = (
-    [TARGET_DATE_OVERRIDE]
-    if TARGET_DATE_OVERRIDE
-    else [datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")]
-)
-# -------------------------------------------------------------------------
+# ---- 取得日付の設定 -----------------------------------------------------------
+JST = ZoneInfo("Asia/Tokyo")
+TARGET_DATE_ENV = (os.environ.get("TARGET_DATE") or "").strip()
+BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "14"))
+MARKET_CLOSE_HHMM = os.environ.get("MARKET_CLOSE_HHMM", "16:00")
+FORCE_INTRADAY = os.environ.get("FORCE_INTRADAY", "0") == "1"
+CLEAN_HOLIDAY_COLUMNS = os.environ.get("CLEAN_HOLIDAY_COLUMNS", "0") == "1"
+CALENDAR_TICKER = "7203.T"   # 営業日カレンダーの基準にする銘柄
 
 # ---- API制御（環境変数で上書き可）------------------------------------------
-CHUNK_SIZE   = int(os.environ.get("CHUNK_SIZE", "90"))
-SLEEP_TIME   = float(os.environ.get("SLEEP_TIME", "0.25"))
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "90"))
+SLEEP_TIME = float(os.environ.get("SLEEP_TIME", "0.25"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "2"))
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "4.0"))
-
 MAX_CODES = int(os.environ.get("MAX_CODES", "0"))
-
 MIN_FILL_RATE = float(os.environ.get("MIN_FILL_RATE", "0.30"))
-
-# 連続空振りがこの回数を超えたらスキップして書き込みへ進む（die しない）
 ABORT_AFTER_EMPTY_CHUNKS = int(os.environ.get("ABORT_AFTER_EMPTY_CHUNKS", "3"))
 
-FIXED_COLS = 2
+YF_DOWNLOAD_TIMEOUT_SEC = 45
+BACKOFF_JITTER_MAX_SEC = 3.0
+EMPTY_CHUNK_SLEEP_MULTIPLIER = 2
+CHUNK_SLEEP_JITTER_MAX_SEC = 1.0
+PRICE_FETCH_LOOKAHEAD_DAYS = 1     # yfinance の end は排他的なため +1日
 
-# ---- 待機時間・リトライ関連のチューニング値 ---------------------------------
-YF_DOWNLOAD_TIMEOUT_SEC = 45       # yf.download の HTTP タイムアウト
-BACKOFF_JITTER_MAX_SEC = 3.0       # リトライ待機に加えるランダムジッターの上限
-EMPTY_CHUNK_SLEEP_MULTIPLIER = 2   # 空データだったチャンクの追加待機倍率（SLEEP_TIME に乗算）
-CHUNK_SLEEP_JITTER_MAX_SEC = 1.0   # チャンク間の通常待機に加えるランダムジッターの上限
-
-# ---- 価格取得期間のバッファ -------------------------------------------------
-PRICE_FETCH_LOOKBACK_DAYS = 7      # 対象日より前に遡って取得する日数（休場日対策）
-PRICE_FETCH_LOOKAHEAD_DAYS = 1     # 対象日より後に伸ばして取得する日数（end は排他的なため）
-
-# ---- Google スプレッドシート書き込み関連 ------------------------------------
-DEFAULT_MIN_COLS = 50              # ワークシートを開く際に確保しておく最小列数
-BATCH_UPDATE_CHUNK_SIZE = 500      # batch_update を分割送信する際の1回あたりの件数上限
-SORT_PREVIEW_COUNT = 5             # 日付列ソート完了ログに表示する先頭件数
+# ---- Google スプレッドシート ------------------------------------------------
+DEFAULT_MIN_COLS = 50
+BATCH_UPDATE_CHUNK_SIZE = 500
+SORT_PREVIEW_COUNT = 5
+SHEETS_MAX_ATTEMPTS = 4
+SHEETS_BACKOFF_SEC = 20
 
 _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
+_DATE_RE = re.compile(r"(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})")
 
 
 def log(msg: str = "") -> None:
@@ -99,29 +117,88 @@ def die(msg: str) -> None:
 
 
 # =============================================================================
-# 日付フォーマット変換
+# 日付ユーティリティ
 # =============================================================================
 
-def to_japanese_date(date_str: str) -> str:
+def to_japanese_date(iso: str) -> str:
+    """'2026-10-09' → '2026年10月9日(金)'"""
     try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return f"{dt.year}年{dt.month}月{dt.day}日({_WEEKDAY_JP[dt.weekday()]})"
+        d = date.fromisoformat(iso)
+        return f"{d.year}年{d.month}月{d.day}日({_WEEKDAY_JP[d.weekday()]})"
     except ValueError:
-        return date_str
+        return iso
 
 
-def from_japanese_date(date_str: str) -> str:
+def parse_date_text(s) -> str | None:
+    """見出しセルの文字列から ISO 日付を取り出す。
+    '2026年10月9日(金)' / '2026年10月9日' / '2026/10/09' / '2026-10-09' に対応。"""
+    m = _DATE_RE.search(str(s))
+    if not m:
+        return None
     try:
-        core = date_str.split("(")[0]
-        dt = datetime.strptime(core, "%Y年%m月%d日")
-        return dt.strftime("%Y-%m-%d")
-    except (ValueError, IndexError):
-        return date_str
+        return date(int(m[1]), int(m[2]), int(m[3])).isoformat()
+    except ValueError:
+        return None
+
+
+def parse_target_dates(raw: str) -> list[str]:
+    """TARGET_DATE の書式: 単日 / カンマ区切り / 'start:end' の範囲"""
+    raw = raw.strip()
+    try:
+        if ":" in raw:
+            a, b = (x.strip() for x in raw.split(":", 1))
+            s, e = date.fromisoformat(a), date.fromisoformat(b)
+            if s > e:
+                s, e = e, s
+            return [(s + timedelta(days=i)).isoformat() for i in range((e - s).days + 1)]
+        return sorted({date.fromisoformat(x.strip()).isoformat()
+                       for x in raw.split(",") if x.strip()})
+    except ValueError:
+        die(f"TARGET_DATE の書式が不正です: '{raw}'  "
+            "（例: 2026-10-09 / 2026-10-06,2026-10-09 / 2026-10-01:2026-10-09）")
+        return []
+
+
+def last_complete_day(now: datetime) -> date:
+    """データが確定している最新の暦日。大引け後(既定16:00以降)なら当日、それ以前は前日。"""
+    if FORCE_INTRADAY:
+        return now.date()
+    h, m = (int(x) for x in MARKET_CLOSE_HHMM.split(":"))
+    return now.date() if now.time() >= dtime(h, m) else now.date() - timedelta(days=1)
+
+
+def build_candidate_dates(now: datetime) -> tuple[list[str], bool, date]:
+    """(候補日リスト[ISO昇順], 明示指定か, 確定済み最新日) を返す。"""
+    last = last_complete_day(now)
+    if TARGET_DATE_ENV:
+        wanted = parse_target_dates(TARGET_DATE_ENV)
+        too_new = [d for d in wanted if date.fromisoformat(d) > last]
+        if too_new:
+            log(f"⚠ 大引け前または未来のため対象外にしました: {', '.join(too_new)}"
+                f"（確定済みの最新日: {last}）")
+        return [d for d in wanted if d not in too_new], True, last
+    n = max(BACKFILL_DAYS, 1)
+    days = [(last - timedelta(days=i)).isoformat() for i in range(n - 1, -1, -1)]
+    return days, False, last
 
 
 # =============================================================================
 # 認証・シート操作
 # =============================================================================
+
+def sheets_call(fn, *args, **kwargs):
+    """Sheets API 呼び出し。429/5xx は待ってリトライする。"""
+    for attempt in range(1, SHEETS_MAX_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (429, 500, 502, 503, 504) or attempt == SHEETS_MAX_ATTEMPTS:
+                raise
+            wait = SHEETS_BACKOFF_SEC * attempt
+            log(f"    Sheets API {status}。{wait}秒待機して再試行 ({attempt}/{SHEETS_MAX_ATTEMPTS})")
+            time.sleep(wait)
+
 
 def authenticate_google_sheets() -> gspread.Client:
     log("Google認証中...")
@@ -134,17 +211,48 @@ def authenticate_google_sheets() -> gspread.Client:
     return gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
 
 
-def get_worksheet_by_gid(
-    gc: gspread.Client, gid: int, min_cols: int = DEFAULT_MIN_COLS
-) -> gspread.Worksheet:
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-    ws = spreadsheet.get_worksheet_by_id(gid)
+_SPREADSHEET = None
+
+
+def get_spreadsheet(gc: gspread.Client):
+    global _SPREADSHEET
+    if _SPREADSHEET is None:
+        _SPREADSHEET = sheets_call(gc.open_by_key, SPREADSHEET_ID)
+    return _SPREADSHEET
+
+
+def get_worksheet_by_gid(gc: gspread.Client, gid: int, min_cols: int = DEFAULT_MIN_COLS):
+    sp = get_spreadsheet(gc)
+    try:
+        ws = sheets_call(sp.get_worksheet_by_id, gid)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = None
     if ws is None:
         die(f"gid={gid} のタブが見つかりません。")
     if ws.col_count < min_cols:
-        ws.add_cols(min_cols - ws.col_count)
-        ws = spreadsheet.get_worksheet_by_id(gid)
+        sheets_call(ws.add_cols, min_cols - ws.col_count)
+        ws = sheets_call(sp.get_worksheet_by_id, gid)
     return ws
+
+
+def ensure_rows(ws, n_rows: int) -> None:
+    if ws.row_count < n_rows:
+        sheets_call(ws.add_rows, n_rows - ws.row_count)
+
+
+def last_nonempty_len(row: list) -> int:
+    for i in range(len(row), 0, -1):
+        if str(row[i - 1]).strip():
+            return i
+    return 0
+
+
+def cell_is_empty(grid: list[list], r: int, c: int) -> bool:
+    """grid は get_all_values の結果。r, c は 1 始まり。範囲外は空扱い。"""
+    if r - 1 >= len(grid):
+        return True
+    row = grid[r - 1]
+    return c - 1 >= len(row) or not str(row[c - 1]).strip()
 
 
 # =============================================================================
@@ -155,16 +263,14 @@ def load_stock_codes_from_sheet(gc: gspread.Client, gid: int) -> list[str]:
     ws = get_worksheet_by_gid(gc, gid)
     log(f"銘柄コード読み込み: タブ '{ws.title}' (gid={gid})")
 
-    rows = ws.get_all_values()
+    rows = sheets_call(ws.get_all_values)
     if not rows:
         die(f"タブ '{ws.title}' にデータがありません。")
 
     max_cols = max(len(r) for r in rows)
     best_col, best_count = -1, 0
     for c in range(max_cols):
-        count = sum(
-            1 for r in rows if c < len(r) and CODE_PATTERN.match(r[c].strip())
-        )
+        count = sum(1 for r in rows if c < len(r) and CODE_PATTERN.match(r[c].strip()))
         if count > best_count:
             best_col, best_count = c, count
 
@@ -184,7 +290,6 @@ def load_stock_codes_from_sheet(gc: gspread.Client, gid: int) -> list[str]:
     if MAX_CODES > 0 and len(codes) > MAX_CODES:
         codes = codes[:MAX_CODES]
         log(f"  MAX_CODES={MAX_CODES} により先頭{MAX_CODES}銘柄に制限")
-
     return codes
 
 
@@ -240,28 +345,53 @@ def _extract_field(raw: pd.DataFrame, field: str, chunk: list[str]):
     return sub
 
 
-def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
-    """始値・高値・安値・終値・出来高の5項目を取得する。
+def get_trading_calendar(days: list[str]) -> set[date]:
+    """7203.T の日足が存在する日 = 東証の営業日。休場日・土日・未確定日は含まれない。"""
+    start = min(days)
+    end = (date.fromisoformat(max(days)) + timedelta(days=PRICE_FETCH_LOOKAHEAD_DAYS)).isoformat()
+    log(f"\n[営業日カレンダー取得] {CALENDAR_TICKER}  {start} 〜 {end} (yfinance {yf.__version__})")
 
-    yf.download は1回の呼び出しで OHLCV をまとめて返すため、
-    追加のAPIコストなしに Open/High/Low を Close/Volume と同時に取得できる。
-    """
+    raw = _download_with_retry([CALENDAR_TICKER], start, end)
+    if raw is None or raw.empty:
+        die(
+            "営業日カレンダーを取得できませんでした。考えられる原因:\n"
+            "  (1) 指定期間がすべて休場日\n"
+            "  (2) yfinance が古い → pip install --upgrade yfinance curl_cffi\n"
+            "  (3) Yahoo Finance のIP制限 → 時間をおいて再実行"
+        )
+    sub = _extract_field(raw, "Close", [CALENDAR_TICKER])
+    if sub is None:
+        die("営業日カレンダー: Close 列が見つかりませんでした。")
+    sub = sub.dropna(how="all")
+    if sub.empty:
+        die("営業日カレンダー: 終値が全てNaNでした。pip install --upgrade yfinance curl_cffi を試してください。")
+
+    idx = sub.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    cal = {ts.date() for ts in idx}
+    log(f"  取得できた営業日: {', '.join(sorted(d.isoformat() for d in cal))}")
+    return cal
+
+
+def fetch_prices(codes: list[str], trade_dates: list[str]) -> tuple[dict, list[str]]:
+    """OHLCV を取得する。戻り値: (results[field][date][code], 取得率を満たした日付リスト)"""
     tickers = [f"{c}.T" for c in codes]
-    start = str(pd.to_datetime(min(target_dates)) - pd.Timedelta(days=PRICE_FETCH_LOOKBACK_DAYS))[:10]
-    end = str(pd.to_datetime(max(target_dates)) + pd.Timedelta(days=PRICE_FETCH_LOOKAHEAD_DAYS))[:10]
-    target_date_map = {pd.to_datetime(d).date(): d for d in target_dates}
+    start = min(trade_dates)
+    end = (date.fromisoformat(max(trade_dates)) + timedelta(days=PRICE_FETCH_LOOKAHEAD_DAYS)).isoformat()
+    target_date_map = {date.fromisoformat(d): d for d in trade_dates}
 
     total_chunks = (len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
     log(f"\n株価データ取得中（{len(codes)}銘柄 / {CHUNK_SIZE}銘柄ずつ / {total_chunks}チャンク）")
-    log(f"  期間: {start} 〜 {end}（対象日: {', '.join(target_dates)}）")
+    log(f"  期間: {start} 〜 {end}（対象日: {', '.join(trade_dates)}）")
     log(f"  取得項目: {', '.join(FIELDS)}")
 
-    results = {field: {d: {} for d in target_dates} for field in FIELDS}
-    filled_codes: set[str] = set()
+    results = {field: {d: {} for d in trade_dates} for field in FIELDS}
+    filled_by_date: dict[str, set[str]] = {d: set() for d in trade_dates}
     consecutive_empty = 0
 
     for i in range(0, len(tickers), CHUNK_SIZE):
-        chunk = tickers[i : i + CHUNK_SIZE]
+        chunk = tickers[i: i + CHUNK_SIZE]
         chunk_num = i // CHUNK_SIZE + 1
 
         raw = _download_with_retry(chunk, start, end)
@@ -270,8 +400,6 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
             consecutive_empty += 1
             log(f"  [{chunk_num}/{total_chunks}] 取得0件")
             if consecutive_empty >= ABORT_AFTER_EMPTY_CHUNKS:
-                # ↓ die() → break に変更
-                # 未上場コード等で後半が空になっても取得済みデータを書き込む
                 log(
                     f"  ⚠ {consecutive_empty}チャンク連続で取得できませんでした。"
                     f"（未上場コード or レート制限）"
@@ -281,20 +409,15 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
             time.sleep(SLEEP_TIME * EMPTY_CHUNK_SLEEP_MULTIPLIER)
             continue
 
-        if chunk_num == 1:
-            log(f"  DEBUG raw.shape   : {raw.shape}")
-            log(f"  DEBUG columns[:6] : {list(raw.columns[:6])}")
-            log(f"  DEBUG index[-5:]  : {[str(x)[:10] for x in raw.index[-5:]]}")
-
         idx = raw.index
         if getattr(idx, "tz", None) is not None:
             idx = idx.tz_localize(None)
         date_to_pos = {ts.date(): pos for pos, ts in enumerate(idx)}
 
         if chunk_num == 1:
-            log(f"  DEBUG 取得できた日付 : {sorted(date_to_pos.keys())}")
-            log(f"  DEBUG 探している日付 : {sorted(target_date_map.keys())}")
-            missing = [d for d in target_date_map if d not in date_to_pos]
+            log(f"  DEBUG raw.shape   : {raw.shape}")
+            log(f"  DEBUG 取得できた日付 : {[d.isoformat() for d in sorted(date_to_pos)]}")
+            missing = [d.isoformat() for d in target_date_map if d not in date_to_pos]
             if missing:
                 log(f"  ⚠ 対象日が取得範囲に存在しません: {missing}")
 
@@ -315,18 +438,14 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
                         continue
                     val = col.iloc[pos]
                     if pd.notna(val):
-                        results[field][d_str][code] = (
-                            int(val) if field == "Volume" else float(val)
-                        )
-                        filled_codes.add(code)
+                        results[field][d_str][code] = int(val) if field == "Volume" else float(val)
+                        filled_by_date[d_str].add(code)
                         filled_chunk += 1
 
         if filled_chunk == 0:
             consecutive_empty += 1
             log(f"  [{chunk_num}/{total_chunks}] {len(chunk)}銘柄中 0件（未上場コード or レート制限）")
             if consecutive_empty >= ABORT_AFTER_EMPTY_CHUNKS:
-                # ↓ die() → break に変更
-                # 600A系など Yahoo 未対応コードが後半に固まっていても止まらない
                 log(
                     f"  ⚠ {consecutive_empty}チャンク連続で空データ。"
                     f"残り {total_chunks - chunk_num} チャンクをスキップして書き込みへ進みます。"
@@ -338,23 +457,23 @@ def fetch_prices(codes: list[str], target_dates: list[str]) -> dict:
 
         time.sleep(SLEEP_TIME + random.uniform(0, CHUNK_SLEEP_JITTER_MAX_SEC))
 
-    fill_rate = len(filled_codes) / len(codes) if codes else 0.0
-    log(f"\n取得成功: {len(filled_codes)}/{len(codes)} 銘柄 ({fill_rate:.1%})")
+    # ---- 日付ごとの取得率判定 ----
+    log("\n日付ごとの取得率:")
+    ok_dates: list[str] = []
+    for d in trade_dates:
+        n = len(filled_by_date[d])
+        rate = n / len(codes) if codes else 0.0
+        ok = rate >= MIN_FILL_RATE
+        log(f"  {d}: {n}/{len(codes)} ({rate:.1%})  {'OK' if ok else f'NG（閾値{MIN_FILL_RATE:.0%}未満のため書き込まない）'}")
+        if ok:
+            ok_dates.append(d)
 
-    if fill_rate < MIN_FILL_RATE:
+    if not ok_dates:
         die(
-            f"取得率 {fill_rate:.1%} が閾値 {MIN_FILL_RATE:.0%} を下回りました。"
+            f"全ての対象日で取得率が閾値 {MIN_FILL_RATE:.0%} を下回りました。"
             "空の日付列を作らないため、シートへの書き込みを中止しました。"
         )
-
-    return results
-
-
-def build_dataframe(codes: list[str], values: dict, target_dates: list[str]) -> pd.DataFrame:
-    df = pd.DataFrame({"銘柄コード": codes, "備考": ""})
-    for d in target_dates:
-        df[d] = df["銘柄コード"].map(values.get(d, {}))
-    return df
+    return results, ok_dates
 
 
 # =============================================================================
@@ -371,133 +490,189 @@ def to_native(value):
     return str(value)
 
 
-def update_spreadsheet(gc: gspread.Client, df: pd.DataFrame, gid: int):
+def update_sheet(gc: gspread.Client, gid: int, codes: list[str],
+                 field_values: dict[str, dict[str, float]], dates: list[str]) -> None:
+    """日付ごとに:
+       ・見出しが無ければ新規列を作る
+       ・見出しがあっても、空のセルには値を補完する（既存の値は上書きしない）
+    """
     ws = get_worksheet_by_gid(gc, gid)
     log(f"\n{ws.title} にデータ書き込み中...")
-    existing = ws.get_all_values()
+    existing = sheets_call(ws.get_all_values)
 
-    df_date_cols = list(df.columns[FIXED_COLS:])
-    iso_to_jp = {d: to_japanese_date(d) for d in df_date_cols}
-
-    non_empty = [d for d in df_date_cols if df[d].notna().any()]
-    skipped = [d for d in df_date_cols if d not in non_empty]
-    if skipped:
-        log(f"  ⚠ 値が0件のためスキップ: {', '.join(skipped)}")
-    if not non_empty:
-        log("  書き込む列がありません")
+    dates = sorted(d for d in dates if field_values.get(d))
+    if not dates:
+        log("  書き込める値がありません")
         return
-    df_date_cols = non_empty
 
+    # ---- 初回書き込み ----
     if not existing:
         log("  初回書き込み")
-        header = list(df.columns[:FIXED_COLS]) + [iso_to_jp[c] for c in df_date_cols]
-        out = df[list(df.columns[:FIXED_COLS]) + df_date_cols]
-        rows = [[to_native(v) for v in row] for row in out.values]
+        desc = sorted(dates, reverse=True)
+        header = FIXED_HEADERS + [to_japanese_date(d) for d in desc]
+        rows = [[code, ""] + [to_native(field_values[d].get(code)) for d in desc] for code in codes]
         ws = get_worksheet_by_gid(gc, gid, min_cols=len(header))
-        ws.update(values=[header] + rows, range_name="A1",
-                  value_input_option="USER_ENTERED")
+        ensure_rows(ws, len(rows) + 1)
+        sheets_call(ws.update, values=[header] + rows, range_name="A1",
+                    value_input_option="USER_ENTERED")
+        log("  書き込み完了！")
         return
 
+    # ---- 既存シートの構造を把握 ----
     header = existing[0]
+    hdr_len = max(last_nonempty_len(header), FIXED_COLS)
 
-    # ★ 既存シートのA列コード→行番号の辞書を作り、以降はこのコードをキーに
-    #    値を引き当てて書き込む（行の並び順には依存しない）ため、
-    #    シート上の実際のコードと一致した行にだけ値が入る。
-    code_to_row = {}
+    col_of: dict[str, int] = {}          # ISO日付 → 列番号(1始まり)
+    for ci in range(FIXED_COLS, hdr_len):
+        iso = parse_date_text(header[ci]) if ci < len(header) else None
+        if iso and iso not in col_of:
+            col_of[iso] = ci + 1
+
+    code_to_row: dict[str, int] = {}     # 銘柄コード → 行番号(1始まり)
     for r, row in enumerate(existing[1:], start=2):
-        if row and row[0]:
-            code_to_row.setdefault(row[0].strip(), r)
+        if row and str(row[0]).strip():
+            code_to_row.setdefault(str(row[0]).strip(), r)
 
-    existing_dates_iso = {from_japanese_date(d) for d in header[FIXED_COLS:]}
-    new_cols_iso = [d for d in df_date_cols if d not in existing_dates_iso]
+    updates: list[dict] = []
 
-    if not new_cols_iso:
-        log("  追加する新しい日付はありません")
+    # ---- 新規日付列（見出しは先頭の更新に入れ、データと同じ batch で送る）----
+    new_dates = [d for d in dates if d not in col_of]
+    next_col = hdr_len + 1
+    for d in new_dates:
+        col_of[d] = next_col
+        updates.append({"range": gspread.utils.rowcol_to_a1(1, next_col),
+                        "values": [[to_japanese_date(d)]]})
+        next_col += 1
+    total_cols = next_col - 1
+    if new_dates:
+        log(f"  新規日付列: {', '.join(to_japanese_date(d) for d in new_dates)}")
+
+    # ---- 空セルの補完（連続する行は1つの範囲にまとめる）----
+    filled_cells = 0
+    healed_dates: list[str] = []
+    for d in dates:
+        c = col_of[d]
+        vals = field_values[d]
+        targets: list[tuple[int, float]] = []
+        for code in codes:
+            if code not in vals:
+                continue
+            r = code_to_row.get(code)
+            if r is None:
+                continue
+            if cell_is_empty(existing, r, c):
+                targets.append((r, vals[code]))
+        targets.sort()
+
+        if targets and d not in new_dates:
+            healed_dates.append(d)
+
+        i = 0
+        while i < len(targets):
+            j = i
+            while j + 1 < len(targets) and targets[j + 1][0] == targets[j][0] + 1:
+                j += 1
+            r0, r1 = targets[i][0], targets[j][0]
+            rng = f"{gspread.utils.rowcol_to_a1(r0, c)}:{gspread.utils.rowcol_to_a1(r1, c)}"
+            updates.append({"range": rng,
+                            "values": [[to_native(v)] for _, v in targets[i:j + 1]]})
+            filled_cells += j - i + 1
+            i = j + 1
+
+    if healed_dates:
+        log(f"  既存列の空セルを補完: {', '.join(to_japanese_date(d) for d in healed_dates)}")
+
+    # ---- シートに無い新規銘柄 ----
+    new_row_codes = [c for c in codes
+                     if c not in code_to_row and any(c in field_values[d] for d in dates)]
+
+    if not updates and not new_row_codes:
+        log("  追加・補完が必要なセルはありません")
         return
 
-    new_cols_jp = [iso_to_jp[d] for d in new_cols_iso]
-    log(f"  追加日付: {', '.join(new_cols_jp)}")
+    ws = get_worksheet_by_gid(gc, gid, min_cols=max(total_cols, hdr_len))
 
-    col_start = len(header) + 1
-    col_end = col_start + len(new_cols_jp) - 1
-    ws = get_worksheet_by_gid(gc, gid, min_cols=col_end)
-    header_range = (
-        f"{gspread.utils.rowcol_to_a1(1, col_start)}"
-        f":{gspread.utils.rowcol_to_a1(1, col_end)}"
-    )
-    ws.update(values=[new_cols_jp], range_name=header_range,
-              value_input_option="USER_ENTERED")
+    for i in range(0, len(updates), BATCH_UPDATE_CHUNK_SIZE):
+        sheets_call(ws.batch_update, updates[i: i + BATCH_UPDATE_CHUNK_SIZE],
+                    value_input_option="USER_ENTERED")
+    log(f"  書き込みセル数: {filled_cells}")
 
-    batch_updates = []
-    new_rows = []
-    for _, row in df.iterrows():
-        code = str(row["銘柄コード"])
-        values = [to_native(row[d]) for d in new_cols_iso]
-        if all(v == "" for v in values):
-            continue
-        row_idx = code_to_row.get(code)
-        if row_idx:
-            cell_range = (
-                f"{gspread.utils.rowcol_to_a1(row_idx, col_start)}"
-                f":{gspread.utils.rowcol_to_a1(row_idx, col_end)}"
-            )
-            batch_updates.append({"range": cell_range, "values": [values]})
-        else:
-            new_rows.append([code] + [""] * (len(header) - 1) + values)
-
-    if batch_updates:
-        log(f"  既存銘柄を更新: {len(batch_updates)} 件")
-        for i in range(0, len(batch_updates), BATCH_UPDATE_CHUNK_SIZE):
-            ws.batch_update(batch_updates[i : i + BATCH_UPDATE_CHUNK_SIZE],
-                            value_input_option="USER_ENTERED")
-
-    if new_rows:
-        log(f"  新規銘柄を追加: {len(new_rows)} 件")
+    if new_row_codes:
         start_row = len(existing) + 1
-        total_cols = len(header) + len(new_cols_jp)
-        ws = get_worksheet_by_gid(gc, gid, min_cols=total_cols)
-        end_a1 = gspread.utils.rowcol_to_a1(start_row + len(new_rows) - 1, total_cols)
-        ws.update(values=new_rows, range_name=f"A{start_row}:{end_a1}",
-                  value_input_option="USER_ENTERED")
+        grid = []
+        for code in new_row_codes:
+            row = [code] + [""] * (total_cols - 1)
+            for d in dates:
+                v = field_values[d].get(code)
+                if v is not None:
+                    row[col_of[d] - 1] = to_native(v)
+            grid.append(row)
+        ensure_rows(ws, start_row + len(grid) - 1)
+        end_a1 = gspread.utils.rowcol_to_a1(start_row + len(grid) - 1, total_cols)
+        sheets_call(ws.update, values=grid, range_name=f"A{start_row}:{end_a1}",
+                    value_input_option="USER_ENTERED")
+        log(f"  新規銘柄を追加: {len(new_row_codes)} 件")
 
     log("  書き込み完了！")
 
 
-def sort_date_columns(gc: gspread.Client, gid: int):
+def remove_empty_holiday_columns(gc: gspread.Client, gid: int, holiday_isos: set[str]) -> None:
+    """休場日の日付列のうち、中身が完全に空のものだけを削除する。"""
+    ws = get_worksheet_by_gid(gc, gid)
+    data = sheets_call(ws.get_all_values)
+    if not data:
+        return
+    header = data[0]
+    targets = []
+    for ci in range(FIXED_COLS, len(header)):
+        iso = parse_date_text(header[ci])
+        if iso and iso in holiday_isos:
+            if all(ci >= len(r) or not str(r[ci]).strip() for r in data[1:]):
+                targets.append(ci + 1)
+    if not targets:
+        return
+    deleter = getattr(ws, "delete_columns", None) or ws.delete_cols
+    for idx in sorted(targets, reverse=True):
+        sheets_call(deleter, idx)
+    log(f"  休場日の空列を削除: {len(targets)} 列")
+
+
+def sort_date_columns(gc: gspread.Client, gid: int) -> None:
     ws = get_worksheet_by_gid(gc, gid)
     log(f"\n{ws.title} の日付列をソート中...")
-    all_data = ws.get_all_values()
+    all_data = sheets_call(ws.get_all_values)
 
-    if not all_data or len(all_data) < 2 or len(all_data[0]) <= FIXED_COLS:
+    if not all_data or len(all_data) < 2:
+        log("  ソート対象の日付列がありません。スキップします")
+        return
+    width = max(last_nonempty_len(all_data[0]), FIXED_COLS)
+    if width <= FIXED_COLS:
         log("  ソート対象の日付列がありません。スキップします")
         return
 
-    header = all_data[0]
+    header = all_data[0][:width]
+    header += [""] * (width - len(header))
     fixed_header = header[:FIXED_COLS]
     date_header = header[FIXED_COLS:]
+    n = len(date_header)
 
-    def parse_date(s: str) -> datetime:
-        try:
-            return datetime.strptime(from_japanese_date(s), "%Y-%m-%d")
-        except ValueError:
-            return datetime.min
+    order = sorted(range(n), key=lambda i: parse_date_text(date_header[i]) or "", reverse=True)
+    if order == list(range(n)):
+        log("  すでに新しい順に並んでいます（書き直しなし）")
+        return
 
-    order = sorted(range(len(date_header)),
-                   key=lambda i: parse_date(date_header[i]), reverse=True)
     sorted_header = [date_header[i] for i in order]
-
     new_data = [fixed_header + sorted_header]
     for row in all_data[1:]:
-        fixed_vals = row[:FIXED_COLS] + [""] * max(0, FIXED_COLS - len(row))
-        date_vals = row[FIXED_COLS:]
-        date_vals += [""] * max(0, len(date_header) - len(date_vals))
+        fixed_vals = (list(row[:FIXED_COLS]) + [""] * FIXED_COLS)[:FIXED_COLS]
+        date_vals = list(row[FIXED_COLS:width])
+        date_vals += [""] * (n - len(date_vals))
         new_data.append(fixed_vals + [date_vals[i] for i in order])
 
-    total_cols = len(new_data[0])
-    ws = get_worksheet_by_gid(gc, gid, min_cols=total_cols)
-    end_a1 = gspread.utils.rowcol_to_a1(len(new_data), total_cols)
-    ws.update(values=new_data, range_name=f"A1:{end_a1}",
-              value_input_option="USER_ENTERED")
+    ws = get_worksheet_by_gid(gc, gid, min_cols=width)
+    end_a1 = gspread.utils.rowcol_to_a1(len(new_data), width)
+    sheets_call(ws.update, values=new_data, range_name=f"A1:{end_a1}",
+                value_input_option="USER_ENTERED")
 
     preview = " → ".join(sorted_header[:SORT_PREVIEW_COUNT])
     suffix = "..." if len(sorted_header) > SORT_PREVIEW_COUNT else ""
@@ -505,35 +680,24 @@ def sort_date_columns(gc: gspread.Client, gid: int):
 
 
 # =============================================================================
-# 疎通確認
-# =============================================================================
-
-def smoke_test(start: str, end: str) -> None:
-    log(f"\n[疎通確認] 7203.T を単独取得... (yfinance {yf.__version__})")
-    raw = _download_with_retry(["7203.T"], start, end)
-    if raw is None or raw.empty:
-        die(
-            "疎通確認に失敗しました。考えられる原因:\n"
-            "  (1) yfinance が古い（0.2.51以前）→ pip install --upgrade yfinance curl_cffi\n"
-            "  (2) Yahoo Finance のIP制限         → 時間をおいて再実行\n"
-            f"  現在のバージョン: yfinance {yf.__version__}"
-        )
-    sub = _extract_field(raw, "Close", ["7203.T"])
-    if sub is None or sub.dropna(how="all").empty:
-        die("疎通確認: 終値が全てNaNでした。pip install --upgrade yfinance curl_cffi を試してください。")
-    log(f"  OK: {len(sub.dropna(how='all'))} 営業日分の終値を取得")
-
-
-# =============================================================================
 # メイン処理
 # =============================================================================
 
 def main():
+    now = datetime.now(JST)
     log("=" * 60)
-    log(f"取得対象日（日本時間）: {TARGET_DATES[0]}")
+    log(f"実行時刻（日本時間）: {now:%Y-%m-%d %H:%M}")
     log(f"yfinance {yf.__version__} / pandas {pd.__version__}")
     log(f"CHUNK_SIZE={CHUNK_SIZE} SLEEP_TIME={SLEEP_TIME} MAX_CODES={MAX_CODES or '無制限'}")
+    mode = f"明示指定 TARGET_DATE={TARGET_DATE_ENV}" if TARGET_DATE_ENV else f"自動（直近{BACKFILL_DAYS}日をバックフィル）"
+    log(f"対象日モード: {mode}")
     log("=" * 60)
+
+    candidates, explicit, last_day = build_candidate_dates(now)
+    if not candidates:
+        die("対象日がありません（指定日がすべて未確定です）。大引け後に実行するか、"
+            "FORCE_INTRADAY=1 を指定してください。")
+    log(f"確定済みの最新日: {last_day} / 候補日: {candidates[0]} 〜 {candidates[-1]}")
 
     gc = authenticate_google_sheets()
 
@@ -541,27 +705,32 @@ def main():
     if not codes:
         die("銘柄コードが0件でした。タブの内容を確認してください。")
 
-    start = str(pd.to_datetime(min(TARGET_DATES)) - pd.Timedelta(days=PRICE_FETCH_LOOKBACK_DAYS))[:10]
-    end = str(pd.to_datetime(max(TARGET_DATES)) + pd.Timedelta(days=PRICE_FETCH_LOOKAHEAD_DAYS))[:10]
-    smoke_test(start, end)
+    calendar = get_trading_calendar(candidates)
+    trade_dates = [d for d in candidates if date.fromisoformat(d) in calendar]
+    holidays = [d for d in candidates if d not in trade_dates]
+    log(f"  対象営業日: {', '.join(trade_dates) or 'なし'}")
+    if holidays:
+        log(f"  休場日・土日（スキップ）: {', '.join(holidays)}")
+    if not trade_dates:
+        die("対象期間に営業日がありません。")
 
-    values = fetch_prices(codes, TARGET_DATES)
+    values, ok_dates = fetch_prices(codes, trade_dates)
 
-    # 始値・高値・安値・終値・出来高を、それぞれ対応するタブへ書き込む
     for field in FIELDS:
         cfg = FIELD_CONFIG[field]
         log("\n" + "=" * 50)
         log(cfg["heading"])
         log("=" * 50)
-        field_df = build_dataframe(codes, values[field], TARGET_DATES)
-        update_spreadsheet(gc, field_df, cfg["gid"])
+        update_sheet(gc, cfg["gid"], codes, values[field], ok_dates)
+        if CLEAN_HOLIDAY_COLUMNS and holidays:
+            remove_empty_holiday_columns(gc, cfg["gid"], set(holidays))
         sort_date_columns(gc, cfg["gid"])
 
     log("\n" + "=" * 50)
     log("全処理完了！")
     log(f"  スプレッドシートID : {SPREADSHEET_ID}")
     log(f"  銘柄数             : {len(codes)}")
-    log(f"  取得日付           : {', '.join(TARGET_DATES)}")
+    log(f"  処理した営業日     : {', '.join(ok_dates)}")
     log(f"  取得項目           : {', '.join(FIELD_CONFIG[f]['label_jp'] for f in FIELDS)}")
     log("=" * 50)
 
