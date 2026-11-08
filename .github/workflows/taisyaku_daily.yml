@@ -30,7 +30,7 @@ jobs:
       - run: pip install requests gspread
       - name: 取得してシートへ書き込み
         env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_SA_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           TAISYAKU_SHEET_ID: ${{ secrets.TAISYAKU_SHEET_ID }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
         run: python "scripts/貸借（日証金）/fetch_taisyaku.py"
