@@ -1,9 +1,11 @@
-requests>=2.32.0
-beautifulsoup4>=4.12.3
-lxml>=5.2.0
-html5lib>=1.1
-pandas>=2.2.2
-xlrd==2.0.1
-openpyxl>=3.1.2
-gspread>=6.1.2
-google-auth>=2.30.0
+# JPX 空売り残高 取り込みスクリプト用
+# pandas 3.x は .xls 読み込みに xlrd>=2.0.2 を要求する
+pandas>=2.2,<4
+xlrd>=2.0.2
+python-calamine>=0.3     # xlrd が使えない場合のフォールバック(.xls/.xlsx 両対応)
+openpyxl>=3.1
+lxml>=5.0                # pd.read_html 用
+gspread>=6.0
+google-auth>=2.0
+requests>=2.31
+beautifulsoup4>=4.12
