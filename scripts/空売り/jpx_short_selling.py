@@ -98,6 +98,12 @@ SHORT_POSITIONS_FILE_RE = re.compile(r"(\d{8})_Short_Positions\.xlsx?$", re.IGNO
 OLE2_SIGNATURE = b"\xd0\xcf\x11\xe0"  # 旧形式 .xls (OLE2) のファイルシグネチャ
 ZIP_SIGNATURE = b"PK"                  # .xlsx (ZIP) のファイルシグネチャ
 
+# 読み込みエンジンの優先順(先頭が使えない場合に次を試す)
+#   pandas 3.x は xlrd>=2.0.2 を要求するため、xlrd が古い環境でも
+#   python-calamine で読めるようにしておく。
+XLS_ENGINES = ("xlrd", "calamine")
+XLSX_ENGINES = ("openpyxl", "calamine")
+
 # Excel シリアル値として date に変換して良いと判断する範囲(概ね1954年〜2119年)
 EXCEL_EPOCH = dt.date(1899, 12, 30)
 EXCEL_SERIAL_MIN = 20000
@@ -145,6 +151,19 @@ def format_date_jp(d: dt.date) -> str:
 def log(msg: str) -> None:
     now = dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
     print(f"[{now}] {msg}", flush=True)
+
+
+def log_library_versions() -> None:
+    """障害調査用に主要ライブラリのバージョンをログ出力する。"""
+    from importlib.metadata import PackageNotFoundError, version
+
+    parts = []
+    for pkg in ("pandas", "xlrd", "python-calamine", "openpyxl", "gspread"):
+        try:
+            parts.append(f"{pkg}={version(pkg)}")
+        except PackageNotFoundError:
+            parts.append(f"{pkg}=(未導入)")
+    log("ライブラリ: " + " / ".join(parts))
 
 
 def norm_text(v: Any) -> str:
@@ -290,17 +309,30 @@ def load_dataframe(data: bytes) -> pd.DataFrame:
     """拡張子に依存せずバイナリ先頭を見て適切なエンジンで読み込む。"""
     head = data[:8]
     if head[:4] == OLE2_SIGNATURE:                # OLE2 = 旧 .xls
-        engine = "xlrd"
+        engines = XLS_ENGINES
     elif head[:2] == ZIP_SIGNATURE:                # ZIP = .xlsx
-        engine = "openpyxl"
+        engines = XLSX_ENGINES
     else:                                          # HTML テーブルの場合
         log("  Excel シグネチャ無し → HTML テーブルとして解析")
         tables = pd.read_html(io.BytesIO(data))
         if not tables:
             raise RuntimeError("表を検出できませんでした。")
         return max(tables, key=len).astype(object)
-    log(f"  Excel 読み込み engine={engine}")
-    return pd.read_excel(io.BytesIO(data), sheet_name=0, header=None, engine=engine)
+
+    # エンジンを順に試す。ライブラリ未導入・バージョン不足(ImportError)の場合のみ
+    # 次のエンジンへフォールバックし、ファイル破損などその他のエラーはそのまま送出する。
+    errors: list[str] = []
+    for engine in engines:
+        try:
+            log(f"  Excel 読み込み engine={engine}")
+            return pd.read_excel(io.BytesIO(data), sheet_name=0, header=None, engine=engine)
+        except ImportError as e:
+            log(f"  engine={engine} は使用不可: {e}")
+            errors.append(f"{engine}: {e}")
+    raise RuntimeError(
+        "Excel を読み込めるエンジンがありません。requirements.txt を確認してください "
+        f"(xlrd>=2.0.2 または python-calamine が必要)。詳細: {' / '.join(errors)}"
+    )
 
 
 # ====================================================================
@@ -615,6 +647,7 @@ def main() -> int:
         f"TARGET_DATE={target_date or '(最新)'} / RATIO_AS_PERCENT={ratio_as_percent} "
         f"/ DRY_RUN={dry_run} / FORCE={force}"
     )
+    log_library_versions()
 
     index = fetch_file_index()
     pub_date, url = resolve_target(index, target_date)
