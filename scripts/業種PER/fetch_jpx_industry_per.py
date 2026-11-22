@@ -75,10 +75,11 @@ ESTIMATE_RULES = {
     "単純＿PBR（倍）": ("単純＿PER（倍）", "単純＿1株当たり\n当期純利益（円）", "単純＿1株当たり\n純資産（円）"),
     "加重＿PBR（倍）": ("加重＿PER（倍）", "加重＿親会社株主に帰属する\n当期純利益合計（円）", "加重＿純資産合計（円）"),
 }
-NO_COMPANY_TEXT = "対象なし"   # 会社数が「－」（その市場・業種に会社が無い）
-ESTIMATE_NOTE = ("灰色の斜体＝推計値。JPXが「－」（PER・PBRがマイナス）や「＊」（PER1000倍以上）で公表していない月を、"
+NO_VALUE_TEXT = "－"   # 値が無いセルはすべて「－」で統一（会社が無い・計算できない・その月のデータが無い）
+ESTIMATE_NOTE = ("黄色の塗りつぶし＝推計値。JPXが「－」（PER・PBRがマイナス）や「＊」（PER1000倍以上）で公表していない月を、"
                  "同じ月の数値から計算（PER＝PBR×1株純資産÷1株利益、加重はPBR×純資産合計÷純利益合計。PBRも同様）。"
-                 "マイナスは赤字（または債務超過）。元のPBR・PERが小数1桁のため誤差あり。「対象なし」＝その区分に会社が無い。")
+                 "マイナスは赤字（または債務超過）。元のPBR・PERが小数1桁のため誤差あり。「－」＝値なし（会社が無い・計算できない・その月のデータが無い）。")
+EST_FILL = {"red": 1.0, "green": 0.95, "blue": 0.7}   # 推計値セルの塗りつぶし（薄い黄色）
 
 
 def estimate(rec, idx, src):
@@ -419,7 +420,7 @@ def build_trend(ss, data_ws):
             for m in months:
                 rec = table.get((m, market, kind))
                 if not rec:
-                    row.append("")            # その月のデータ自体が無い
+                    row.append(NO_VALUE_TEXT)   # その月のデータ自体が無い
                     continue
                 raw = str(rec[idx[src]]).strip()
                 v = to_num(raw)
@@ -427,14 +428,14 @@ def build_trend(ss, data_ws):
                     row.append(v)
                     continue
                 if str(rec[idx["会社数"]]).strip() in JPX_SYMBOLS:
-                    row.append(NO_COMPANY_TEXT)
+                    row.append(NO_VALUE_TEXT)   # その区分に会社が無い
                     continue
                 e = estimate(rec, idx, src)
                 if e is not None:
                     est_cells.append((len(out), len(row)))
                     row.append(e)
                 else:
-                    row.append(raw if raw in JPX_SYMBOLS else "")
+                    row.append(NO_VALUE_TEXT)   # 計算もできない
             out.append(row)
 
     ws = get_or_create(ss, TREND_SHEET, rows=len(out) + 10, cols=len(header) + 2)
@@ -489,15 +490,17 @@ def format_trend(ss, ws, nrows, ncols, est_cells=()):
         # 月の列：書式を毎回いったん標準に戻す（前回の推計値の色が別のセルに残らないように）
         {"repeatCell": {"range": rng(7, ncols), "cell": {"userEnteredFormat": {
             "numberFormat": {"type": "NUMBER", "pattern": "0.0"},
+            "horizontalAlignment": "RIGHT",
+            "backgroundColor": {"red": 1, "green": 1, "blue": 1},
             "textFormat": {"italic": False, "foregroundColor": {"red": 0, "green": 0, "blue": 0}}}},
-                        "fields": "userEnteredFormat.numberFormat,userEnteredFormat.textFormat.italic,userEnteredFormat.textFormat.foregroundColor"}},
+                        "fields": "userEnteredFormat.numberFormat,userEnteredFormat.horizontalAlignment,userEnteredFormat.backgroundColor,"
+                                  "userEnteredFormat.textFormat.italic,userEnteredFormat.textFormat.foregroundColor"}},
         # 見出し「指標」のセルに凡例のメモ
         {"updateCells": {"range": rng(2, 3, 0, 1), "rows": [{"values": [{"note": ESTIMATE_NOTE}]}], "fields": "note"}},
     ]
     for r, c in est_cells:
         reqs.append({"repeatCell": {"range": rng(c, c + 1, r, r + 1), "cell": {"userEnteredFormat": {
-            "textFormat": {"italic": True, "foregroundColor": {"red": 0.45, "green": 0.45, "blue": 0.45}}}},
-            "fields": "userEnteredFormat.textFormat.italic,userEnteredFormat.textFormat.foregroundColor"}})
+            "backgroundColor": EST_FILL}}, "fields": "userEnteredFormat.backgroundColor"}})
     if not has_cf:
         # 変化の方向が一目で分かるように：上昇は赤、低下は青（D〜G列）
         ranges = [rng(3, 7)]
