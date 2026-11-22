@@ -58,6 +58,7 @@ METRIC_WORDS = {"PER": ["per", "p/e"], "PBR": ["pbr", "p/b"],
                 "NA": ["純資産", "bps", "netassets", "bookvalue"]}
 GROUP_WORDS = {"単純": ["単純", "simple"], "加重": ["加重", "weighted"]}
 HEADER_SCAN_UP = 4   # 「種別」の行から上に何行まで見出しとみなすか
+NOTE_MAX_LEN = 40    # これより長いセルは注記とみなして見出しの判定に使わない
 
 # 推移シートで並べる指標と表示名
 TREND_METRICS = [("単純＿PER（倍）", "単純PER"), ("加重＿PER（倍）", "加重PER"),
@@ -117,6 +118,17 @@ def locate_table(df):
         row = [norm(x) for x in df.iloc[r].tolist()]
         if "種別" not in row or "industry" not in row:
             continue
+        # まず、見出しが保存用の見出し（HEADER）と同じ文字かで探す（今のJPXの表はこれで全列そろう）
+        exact = exact_columns(row)
+        if exact:
+            start = r + 1
+            while start < nrows:
+                v = to_cell(df.iat[start, exact["会社数"]])
+                if isinstance(v, (int, float)) or v in ("－", "-"):
+                    break
+                start += 1
+            print("列の対応（見出し一致）: " + ", ".join(f"{k}=列{v + 1}" for k, v in exact.items()))
+            return exact, start
         # 基本列（「種別」の行の前後数行から探す）
         near = range(max(0, r - HEADER_SCAN_UP), min(nrows, r + HEADER_SCAN_UP + 1))
         cols = {}
@@ -144,13 +156,17 @@ def locate_table(df):
             cur = ""
             for c in range(ncol):
                 v = norm(df.iat[h, c])
+                if len(v) > NOTE_MAX_LEN:
+                    continue
                 for g, words in GROUP_WORDS.items():
                     if any(w in v for w in words):
                         cur = g
                 if cur and not group[c]:
                     group[c] = cur
 
-        texts = ["".join(norm(df.iat[h, c]) for h in hdr_rows) for c in range(ncol)]
+        # 注記のような長い文章（「PER・PBRがマイナス…」など）は見出しとみなさない
+        texts = ["".join(norm(df.iat[h, c]) for h in hdr_rows if len(norm(df.iat[h, c])) <= NOTE_MAX_LEN)
+                 for c in range(ncol)]
         for key, _ in METRIC_KEYS:
             cands = []
             for c in range(ncol):
@@ -180,6 +196,29 @@ def locate_table(df):
         print("列の対応: " + ", ".join(f"{k}=列{v + 1}" for k, v in cols.items()))
         return cols, start
     return None, None
+
+
+def exact_columns(row):
+    """見出し行の文字がHEADERと一致する列を返す（全部そろわなければ None）"""
+    pos = {}
+    for c, v in enumerate(row):
+        if v and v not in pos:
+            pos[v] = c
+    names = {"市場区分名": "市場区分名", "Section": "Section", "種別": "種別", "Industry": "Industry", "会社数": "会社数"}
+    cols = {}
+    for name, label in names.items():
+        c = pos.get(norm(label))
+        if c is None:
+            return None
+        cols[name] = c
+    metric_heads = HEADER[6:]   # 単純4項目、加重4項目の順
+    keys = [(k, g) for g in ("単純", "加重") for k, _ in METRIC_KEYS]
+    for key, label in zip(keys, metric_heads):
+        c = pos.get(norm(label))
+        if c is None:
+            return None
+        cols[key] = c
+    return cols
 
 
 def dump_header(df, rows):
