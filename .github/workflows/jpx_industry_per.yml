@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       force_ym:
-        description: "取得する年月（例 202610）。空なら最新月"
+        description: "取得する年月（例 202610。複数はカンマ区切りで 202601,202602）。空なら最新月"
         required: false
         default: ""
 
@@ -27,7 +27,7 @@ jobs:
           cache-dependency-path: "scripts/業種PER/requirements.txt"
       - name: 依存関係のインストール
         run: pip install -r "scripts/業種PER/requirements.txt"
-      - name: JPX業種別PERを取得してスプシに追記
+      - name: JPX業種別PERを取得して「業種別PER」に追記し、「業種別PER推移」を更新
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           FORCE_YM: ${{ github.event.inputs.force_ym }}
