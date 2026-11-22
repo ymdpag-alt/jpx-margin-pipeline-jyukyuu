@@ -36,7 +36,8 @@ DATA_SHEET = "業種別PER"
 TREND_SHEET = "業種別PER推移"
 TARGET_SHEET_KEYWORD = "連結"
 MARKET_SHEET_KEYWORD = "単体"   # 「市場別（単体）」シート：市場ごとの行（種別「－」）を追加で取り込む
-JPX_SYMBOLS = ("－", "＊", "-", "*")  # JPXの記号（－：該当なし・マイナス、＊：PER1000倍以上）   # Excel内でこの文字を含むシートを優先（無ければ見出しが見つかった最初のシート）
+JPX_SYMBOLS = ("－", "＊", "-", "*")
+MARKET_NAMES = ("プライム市場", "スタンダード市場", "グロース市場")  # JPXの記号（－：該当なし・マイナス、＊：PER1000倍以上）   # Excel内でこの文字を含むシートを優先（無ければ見出しが見つかった最初のシート）
 MIN_ROWS = 100                   # 取り込み行数がこれ未満なら、表の構造が変わったとみなして中止
 CREDENTIALS_ENV = "GOOGLE_SERVICE_ACCOUNT_JSON"
 FORCE_YM_ENV = "FORCE_YM"        # 例: '202610' または '202601,202602'。空なら最新月
@@ -106,7 +107,10 @@ def to_num(v):
 
 # ===== JPXから取得 =====
 def find_links(html):
-    links = {ym: urljoin(PAGE_URL, href) for href, ym in LINK_PATTERN.findall(html)}
+    # 同じ年月が2回出る場合は最初のリンクを使う（ページ下部に「参考のサンプルファイル」perpbr202111.xlsx があるため）
+    links = {}
+    for href, ym in LINK_PATTERN.findall(html):
+        links.setdefault(ym, urljoin(PAGE_URL, href))
     if not links:
         raise RuntimeError("perpbrYYYYMM.xlsx のリンクが見つかりません（JPXのページ構成が変わった可能性）")
     return links
@@ -265,6 +269,25 @@ def parse_excel(content, ym):
     raise RuntimeError("「種別」「Industry」の見出しがあるシートが見つかりません")
 
 
+def metric_col(row, key):
+    """見出し行から「単純＿PER」「加重＿当期純利益」のような列を探す。
+    単体シートは見出しの文字が少し違う（例：加重＿当期純利益（円）、加重＿純資産（円））ため、
+    先頭の「単純／加重」と指標の言葉で判定する"""
+    metric, group = key
+    for c, v in enumerate(row):
+        if not v.startswith(norm(group)):
+            continue
+        if metric == "NA":
+            if "純資産" in v and "当期純利益" not in v:
+                return c
+        elif metric == "NI":
+            if "当期純利益" in v:
+                return c
+        elif norm(metric) in v:
+            return c
+    return None
+
+
 def parse_market_sheet(sheets, ym, used_name):
     """「市場別（単体）」シートから市場ごとの行を取り込む（種別・Industryは「－」）。
     うまく読めなくても全体は止めず、警告だけ出す（連結の業種データを優先）"""
@@ -284,8 +307,8 @@ def parse_market_sheet(sheets, ym, used_name):
                 pos[v] = c
         cols = {name: pos.get(norm(name)) for name in ("市場区分名", "Section", "種別", "Industry", "会社数")}
         keys = [(k, g) for g in ("単純", "加重") for k, _ in METRIC_KEYS]
-        for key, label in zip(keys, HEADER[6:]):
-            cols[key] = pos.get(norm(label))
+        for key in keys:
+            cols[key] = metric_col(row, key)
         lack = [k for k, v in cols.items() if v is None and k not in ("種別", "Industry", "Section")]
         if lack:
             dump_header(df, range(max(0, r - 2), min(nrows, r + 2)))
@@ -466,21 +489,32 @@ def main():
     creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
     ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
     data_ws = get_or_create(ss, DATA_SHEET, rows=1000, cols=len(HEADER))
-    existing = set(data_ws.col_values(1)[1:])
+    # 登録済みの行（年月・市場区分名・種別）。登録済みの月でも、足りない行（市場別の行など）があれば追記する
+    all_rows = data_ws.get_all_values()
+    head = all_rows[0] if all_rows else HEADER
+    ci = {h: i for i, h in enumerate(head)}
+    existing = {(r[ci["年月"]], r[ci["市場区分名"]], r[ci["種別"]]) for r in all_rows[1:] if len(r) > ci["種別"]}
+    months_have = {k[0] for k in existing}
+    markets_have = {k[0] for k in existing if k[2] in ("－", "-") and k[1] in MARKET_NAMES}
 
     added = 0
     for ym in sorted(targets):
         label = ym_label(ym)
-        if label in existing:
-            print(f"{label} は登録済みのためスキップ")
+        if label in months_have and label in markets_have:
+            print(f"{label} は登録済み（市場別の行もあり）のためスキップ")
             continue
         res = session.get(links[ym], timeout=TIMEOUT_SEC)
         res.raise_for_status()
         rows = parse_excel(res.content, ym)
-        append_month(data_ws, rows)
-        existing.add(label)
+        new_rows = [r for r in rows if (r[0], r[1], r[3]) not in existing]
+        if not new_rows:
+            print(f"{label}: 追記する行なし")
+            continue
+        append_month(data_ws, new_rows)
+        existing |= {(r[0], r[1], r[3]) for r in new_rows}
         added += 1
-        print(f"{label}: {len(rows)}行を追記")
+        print(f"{label}: {len(new_rows)}行を追記" + ("（登録済みの月に不足分を追加）" if label in months_have else ""))
+        months_have.add(label)
 
     build_trend(ss, data_ws)
     print(f"完了（追記 {added}か月）")
