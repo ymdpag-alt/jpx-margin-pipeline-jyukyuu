@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from urllib.parse import urljoin
 
 import gspread
@@ -66,7 +66,13 @@ NOTE_MAX_LEN = 40    # これより長いセルは注記とみなして見出し
 # 推移シートで並べる指標と表示名
 TREND_METRICS = [("単純＿PER（倍）", "単純PER"), ("加重＿PER（倍）", "加重PER"),
                  ("単純＿PBR（倍）", "単純PBR"), ("加重＿PBR（倍）", "加重PBR")]
-TREND_FIXED_COLS = ["市場区分名", "種別", "指標", "前月差", "前月比", "3か月差", "12か月差"]
+# 変化を見る期間（表示名, 何か月前と比べるか）。それぞれ「差」（倍の差）と「比」（変化率）を出す
+CHANGE_SPANS = [("前月", 1), ("3か月", 3), ("12か月", 12), ("2年", 24), ("3年", 36), ("5年", 60)]
+TREND_FIXED_COLS = ["市場区分名", "種別", "指標"] + [f"{name}{kind}" for name, _ in CHANGE_SPANS for kind in ("差", "比")]
+# 過去分の自動取り込み：この年月以降で、まだ無い月をJPXのページから取り込む（5年差に必要な分）。
+# 2022年3月以前は市場区分が今と違う（東証1部など）ため、市場別の行は5年差が「－」になる（規模別の大型・中型・小型は比較できる）
+BACKFILL_FROM = "202101"
+MARKET_ROWS_FROM = "202204"   # プライム・スタンダード・グロースの市場別の行がある最初の月
 # JPXが「－」（マイナス）「＊」（1000倍以上）で公表しない値を、同じ行の他の数値から計算するための式
 #   株価（単純平均）＝PBR×1株純資産＝PER×1株利益、時価総額（加重）＝PBR×純資産合計＝PER×純利益合計
 ESTIMATE_RULES = {
@@ -394,12 +400,14 @@ def build_trend(ss, data_ws):
         if label <= oldest:
             break
         y, m = (y, m - 1) if m > 1 else (y - 1, 12)
-    # 行の並びは最新月の並び順に合わせる
-    # 最新月に無い行（過去の月だけにある行）も消さずに、後ろに並べる
+    # 行の並びは最新月の並び順に合わせる。最新月に無い行は、直近3か月にある行だけ後ろに残す
+    # （古い市場区分「東証1部」などの行は推移に出さない）
+    recent = set(have[:4])
     keys, seen = [], set()
     for want_latest in (True, False):
         for r in values[1:]:
-            if (r[idx["年月"]] == latest) != want_latest or not re.fullmatch(r"\d{4}/\d{2}", r[idx["年月"]]):
+            ym = r[idx["年月"]]
+            if (ym == latest) != want_latest or ym not in recent:
                 continue
             k = (r[idx["市場区分名"]], r[idx["種別"]])
             if k not in seen:
@@ -416,7 +424,7 @@ def build_trend(ss, data_ws):
     est_cells = []   # 推計値のセル（行・列は0始まり）
     for market, kind in keys:
         for src, label in TREND_METRICS:
-            row = [market, kind, label, "", "", "", ""]
+            row = [market, kind, label] + [""] * (len(TREND_FIXED_COLS) - 3)
             for m in months:
                 rec = table.get((m, market, kind))
                 if not rec:
@@ -438,28 +446,29 @@ def build_trend(ss, data_ws):
                     row.append(NO_VALUE_TEXT)   # 計算もできない
             out.append(row)
 
-    ws = get_or_create(ss, TREND_SHEET, rows=len(out) + 10, cols=len(header) + 2)
+    max_span = max(n for _, n in CHANGE_SPANS)
+    total_cols = max(len(header), first_month_col + max_span)
+    ws = get_or_create(ss, TREND_SHEET, rows=len(out) + 10, cols=total_cols)
     ws.clear()
-    ws.resize(rows=max(len(out) + 10, 50), cols=max(len(header), len(TREND_FIXED_COLS) + 13))
+    ws.resize(rows=max(len(out) + 10, 50), cols=total_cols)
     ws.update(range_name="A1", values=out, value_input_option="RAW")
 
-    # 前月差・前月比・3か月差・12か月差は数式（最新月列との差）
+    # 差・比は数式（最新月の列と、nか月前の列を比べる。どちらかが数値でなければ空欄）
     def a1(col):
         return gspread.utils.rowcol_to_a1(1, col).rstrip("1")
     cur = a1(first_month_col)
-    prev = a1(first_month_col + 1)
-    m3 = a1(first_month_col + 3)
-    m12 = a1(first_month_col + 12)
     formulas = []
     for r in range(2, len(out) + 1):
-        formulas.append([
-            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({prev}{r})),{cur}{r}-{prev}{r},"")',
-            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({prev}{r}),N({prev}{r})<>0),{cur}{r}/{prev}{r}-1,"")',
-            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({m3}{r})),{cur}{r}-{m3}{r},"")',
-            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({m12}{r})),{cur}{r}-{m12}{r},"")',
-        ])
-    ws.update(range_name=f"D2:G{len(out)}", values=formulas, value_input_option="USER_ENTERED")
-    format_trend(ss, ws, len(out), len(header), est_cells)
+        row = []
+        for _, n in CHANGE_SPANS:
+            old_c = a1(first_month_col + n)
+            both = f"ISNUMBER({cur}{r}),ISNUMBER({old_c}{r})"
+            row.append(f'=IF(AND({both}),{cur}{r}-{old_c}{r},"")')
+            row.append(f'=IF(AND({both},N({old_c}{r})<>0),{cur}{r}/{old_c}{r}-1,"")')
+        formulas.append(row)
+    last_fixed = a1(len(TREND_FIXED_COLS))
+    ws.update(range_name=f"D2:{last_fixed}{len(out)}", values=formulas, value_input_option="USER_ENTERED")
+    format_trend(ss, ws, len(out), total_cols, est_cells)
     print(f"推計値で補ったセル: {len(est_cells)}")
     print(f"推移シートを更新: {len(out) - 1}行 × {len(months)}か月")
 
@@ -467,7 +476,7 @@ def build_trend(ss, data_ws):
 def format_trend(ss, ws, nrows, ncols, est_cells=()):
     sid = ws.id
     meta = ss.fetch_sheet_metadata({"fields": "sheets(properties(sheetId),conditionalFormats)"})
-    has_cf = any(s["properties"]["sheetId"] == sid and s.get("conditionalFormats") for s in meta["sheets"])
+    cf_count = sum(len(s.get("conditionalFormats", [])) for s in meta["sheets"] if s["properties"]["sheetId"] == sid)
 
     def rng(c0, c1, r0=1, r1=None):
         g = {"sheetId": sid, "startRowIndex": r0, "startColumnIndex": c0, "endColumnIndex": c1}
@@ -481,14 +490,19 @@ def format_trend(ss, ws, nrows, ncols, est_cells=()):
         {"repeatCell": {"range": rng(0, ncols, 0, 1), "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
                         "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}}},
                         "fields": "userEnteredFormat.textFormat.bold,userEnteredFormat.backgroundColor"}},
-        {"repeatCell": {"range": rng(3, 4), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "+0.0;-0.0;0.0"}}},
-                        "fields": "userEnteredFormat.numberFormat"}},
-        {"repeatCell": {"range": rng(4, 5), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "+0.0%;-0.0%;0.0%"}}},
-                        "fields": "userEnteredFormat.numberFormat"}},
-        {"repeatCell": {"range": rng(5, 7), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "+0.0;-0.0;0.0"}}},
-                        "fields": "userEnteredFormat.numberFormat"}},
+    ]
+    nfix = len(TREND_FIXED_COLS)
+    for i in range(3, nfix):
+        is_ratio = TREND_FIXED_COLS[i].endswith("比")
+        fmt = {"type": "PERCENT", "pattern": "+0.0%;-0.0%;0.0%"} if is_ratio else {"type": "NUMBER", "pattern": "+0.0;-0.0;0.0"}
+        reqs.append({"repeatCell": {"range": rng(i, i + 1), "cell": {"userEnteredFormat": {"numberFormat": fmt}},
+                                    "fields": "userEnteredFormat.numberFormat"}})
+    # 差・比の列の塗りつぶしも白に戻す（列の並びが変わったときに前の黄色が残らないように）
+    reqs.append({"repeatCell": {"range": rng(3, nfix), "cell": {"userEnteredFormat": {
+        "backgroundColor": {"red": 1, "green": 1, "blue": 1}}}, "fields": "userEnteredFormat.backgroundColor"}})
+    reqs += [
         # 月の列：書式を毎回いったん標準に戻す（前回の推計値の色が別のセルに残らないように）
-        {"repeatCell": {"range": rng(7, ncols), "cell": {"userEnteredFormat": {
+        {"repeatCell": {"range": rng(nfix, ncols), "cell": {"userEnteredFormat": {
             "numberFormat": {"type": "NUMBER", "pattern": "0.0"},
             "horizontalAlignment": "RIGHT",
             "backgroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -501,17 +515,19 @@ def format_trend(ss, ws, nrows, ncols, est_cells=()):
     for r, c in est_cells:
         reqs.append({"repeatCell": {"range": rng(c, c + 1, r, r + 1), "cell": {"userEnteredFormat": {
             "backgroundColor": EST_FILL}}, "fields": "userEnteredFormat.backgroundColor"}})
-    if not has_cf:
-        # 変化の方向が一目で分かるように：上昇は赤、低下は青（D〜G列）
-        ranges = [rng(3, 7)]
-        reqs += [
-            {"addConditionalFormatRule": {"rule": {"ranges": ranges, "booleanRule": {
-                "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
-                "format": {"textFormat": {"foregroundColor": {"red": 0.8, "green": 0, "blue": 0}}}}}, "index": 0}},
-            {"addConditionalFormatRule": {"rule": {"ranges": ranges, "booleanRule": {
-                "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
-                "format": {"textFormat": {"foregroundColor": {"red": 0, "green": 0, "blue": 0.8}}}}}, "index": 1}},
-        ]
+    # 条件付き書式は毎回作り直す（列の数が変わっても色分けがずれないように）
+    for _ in range(cf_count):
+        reqs.append({"deleteConditionalFormatRule": {"sheetId": sid, "index": 0}})
+    # 変化の方向が一目で分かるように：上昇は赤、低下は青（差・比の列）
+    ranges = [rng(3, nfix)]
+    reqs += [
+        {"addConditionalFormatRule": {"rule": {"ranges": ranges, "booleanRule": {
+            "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
+            "format": {"textFormat": {"foregroundColor": {"red": 0.8, "green": 0, "blue": 0}}}}}, "index": 0}},
+        {"addConditionalFormatRule": {"rule": {"ranges": ranges, "booleanRule": {
+            "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+            "format": {"textFormat": {"foregroundColor": {"red": 0, "green": 0, "blue": 0.8}}}}}, "index": 1}},
+    ]
     ss.batch_update({"requests": reqs})
 
 
@@ -544,23 +560,32 @@ def main():
     months_have = {k[0] for k in existing}
     markets_have = {k[0] for k in existing if k[2] in ("－", "-") and k[1] in MARKET_NAMES}
 
-    # 登録済みなのに市場別の行が無い月は、JPXのページにあれば自動で補う
-    auto = sorted({k[0].replace("/", "") for k in existing if re.fullmatch(r"\d{4}/\d{2}", k[0])}
-                  - {m.replace("/", "") for m in markets_have} - set(targets))
-    auto = [ym for ym in auto if ym in links]
+    # 自動で補う月（手動の force_ym とは別）
+    #  ① 登録済みなのに市場別の行が無い月
+    #  ② BACKFILL_FROM 以降で、まだ1行も無い月（2年・3年・5年差の計算用）
+    auto = {k[0].replace("/", "") for k in existing
+            if re.fullmatch(r"\d{4}/\d{2}", k[0]) and k[0].replace("/", "") >= MARKET_ROWS_FROM} - {m.replace("/", "") for m in markets_have}
+    auto |= {ym for ym in links if ym >= BACKFILL_FROM and ym_label(ym) not in months_have}
+    auto = sorted(ym for ym in auto - set(targets) if ym in links)
     if auto:
-        print(f"市場別の行が無い月を補います: {auto}")
-        targets = list(targets) + auto
+        print(f"自動で補う月: {auto}")
 
-    added = 0
-    for ym in sorted(targets):
+    added, failed = 0, []
+    for ym in sorted(set(targets) | set(auto)):
         label = ym_label(ym)
         if label in months_have and label in markets_have:
             print(f"{label} は登録済み（市場別の行もあり）のためスキップ")
             continue
-        res = session.get(links[ym], timeout=TIMEOUT_SEC)
-        res.raise_for_status()
-        rows = parse_excel(res.content, ym)
+        try:
+            res = session.get(links[ym], timeout=TIMEOUT_SEC)
+            res.raise_for_status()
+            rows = parse_excel(res.content, ym)
+        except Exception as e:  # 古い月は表の形が違うことがある。自動で補う月は止めずに次へ
+            if ym in auto:
+                print(f"注意: {label} は取り込めませんでした（{e}）")
+                failed.append(label)
+                continue
+            raise
         new_rows = [r for r in rows if (r[0], r[1], r[3]) not in existing]
         if not new_rows:
             print(f"{label}: 追記する行なし")
@@ -570,6 +595,10 @@ def main():
         added += 1
         print(f"{label}: {len(new_rows)}行を追記" + ("（登録済みの月に不足分を追加）" if label in months_have else ""))
         months_have.add(label)
+        if any(r[3] in ("－", "-") and r[1] in MARKET_NAMES for r in new_rows):
+            markets_have.add(label)
+    if failed:
+        print(f"取り込めなかった月（{len(failed)}か月）: {failed}")
 
     build_trend(ss, data_ws)
     print(f"完了（追記 {added}か月）")
