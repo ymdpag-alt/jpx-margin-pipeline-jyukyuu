@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 JPX「規模別・業種別PER・PBR（連結・単体）一覧」（月次Excel）を取得し、
-スプレッドシート「００８‐ニュース」の「業種別PER」シートに追記する。
+スプレッドシート「」の「業種別PER」シートに追記する。
 
 - JPXのページから perpbrYYYYMM.xlsx のリンクを探し、最新月（または FORCE_YM で指定した月）を取得
 - Excelの全シートを、行ごとにそのまま転記する（JPXの表の作りが変わっても取りこぼさないため）
@@ -24,7 +24,7 @@ from google.oauth2.service_account import Credentials
 JST = timezone(timedelta(hours=9))
 PAGE_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/04.html"
 LINK_PATTERN = re.compile(r'href="([^"]*?perpbr(\d{6})\.xlsx)"')
-SPREADSHEET_ID = "1dZtTjwpeaE8p5QKX1lYfP3mQTKZck7q_K-F2jqVjoNA"  # ００８‐ニュース
+SPREADSHEET_ID = "1QheVVw97DnHjdymEYNFwvgiQhgX8SX-bPxjlHmZpG2I"  # ００８‐ニュース
 SHEET_NAME = "業種別PER"
 BASE_HEADER = ["データ年月", "取得日時", "元シート名", "元の行番号"]
 MAX_VALUE_COLS = 40            # 元の表から転記する最大列数
