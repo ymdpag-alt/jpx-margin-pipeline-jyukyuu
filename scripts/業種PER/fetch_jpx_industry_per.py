@@ -34,7 +34,9 @@ LINK_PATTERN = re.compile(r'href="([^"]*?perpbr(\d{6})\.xlsx)"')
 SPREADSHEET_ID = "1QheVVw97DnHjdymEYNFwvgiQhgX8SX-bPxjlHmZpG2I"  # 00000cloudeデータ
 DATA_SHEET = "業種別PER"
 TREND_SHEET = "業種別PER推移"
-TARGET_SHEET_KEYWORD = "連結"   # Excel内でこの文字を含むシートを優先（無ければ見出しが見つかった最初のシート）
+TARGET_SHEET_KEYWORD = "連結"
+MARKET_SHEET_KEYWORD = "単体"   # 「市場別（単体）」シート：市場ごとの行（種別「－」）を追加で取り込む
+JPX_SYMBOLS = ("－", "＊", "-", "*")  # JPXの記号（－：該当なし・マイナス、＊：PER1000倍以上）   # Excel内でこの文字を含むシートを優先（無ければ見出しが見つかった最初のシート）
 MIN_ROWS = 100                   # 取り込み行数がこれ未満なら、表の構造が変わったとみなして中止
 CREDENTIALS_ENV = "GOOGLE_SERVICE_ACCOUNT_JSON"
 FORCE_YM_ENV = "FORCE_YM"        # 例: '202610' または '202601,202602'。空なら最新月
@@ -257,8 +259,57 @@ def parse_excel(content, ym):
             out.append(row)
         if len(out) < MIN_ROWS:
             raise RuntimeError(f"取り込み行数が{len(out)}行で少なすぎます（表の構造が変わった可能性）")
+        have = {(row[1], row[3]) for row in out}
+        out += [row for row in parse_market_sheet(sheets, ym, name) if (row[1], row[3]) not in have]
         return out
     raise RuntimeError("「種別」「Industry」の見出しがあるシートが見つかりません")
+
+
+def parse_market_sheet(sheets, ym, used_name):
+    """「市場別（単体）」シートから市場ごとの行を取り込む（種別・Industryは「－」）。
+    うまく読めなくても全体は止めず、警告だけ出す（連結の業種データを優先）"""
+    names = [n for n in sheets if MARKET_SHEET_KEYWORD in str(n) and n != used_name]
+    if not names:
+        print(f"注意: 「{MARKET_SHEET_KEYWORD}」のシートが無いため、市場別の行は取り込みません")
+        return []
+    df = sheets[names[0]]
+    nrows, ncol = df.shape
+    for r in range(min(nrows, 60)):
+        row = [norm(x) for x in df.iloc[r].tolist()]
+        if "市場区分名" not in row or "会社数" not in row:
+            continue
+        pos = {}
+        for c, v in enumerate(row):
+            if v and v not in pos:
+                pos[v] = c
+        cols = {name: pos.get(norm(name)) for name in ("市場区分名", "Section", "種別", "Industry", "会社数")}
+        keys = [(k, g) for g in ("単純", "加重") for k, _ in METRIC_KEYS]
+        for key, label in zip(keys, HEADER[6:]):
+            cols[key] = pos.get(norm(label))
+        lack = [k for k, v in cols.items() if v is None and k not in ("種別", "Industry", "Section")]
+        if lack:
+            dump_header(df, range(max(0, r - 2), min(nrows, r + 2)))
+            print(f"注意: 「{names[0]}」の見出しが見つからない列があるため、市場別の行は取り込みません: {lack}")
+            return []
+        out = []
+        for i in range(r + 1, nrows):
+            count = to_cell(df.iat[i, cols["会社数"]])
+            market = to_cell(df.iat[i, cols["市場区分名"]])
+            if not (isinstance(count, (int, float)) or count in JPX_SYMBOLS) or market == "":
+                continue
+            kind = to_cell(df.iat[i, cols["種別"]]) if cols["種別"] is not None else "－"
+            if kind not in ("", "－", "-"):
+                continue   # 連結シートの業種の行と重ならないよう、市場全体の行だけにする
+            out.append([ym_label(ym), market,
+                        to_cell(df.iat[i, cols["Section"]]) if cols["Section"] is not None else "",
+                        "－",
+                        to_cell(df.iat[i, cols["Industry"]]) if cols["Industry"] is not None else "－",
+                        count]
+                       + [to_cell(df.iat[i, cols[k]]) for k in keys])
+        print(f"「{names[0]}」から市場別の行を{len(out)}行取り込み")
+        return out
+    print(f"注意: 「{names[0]}」に見出し行（市場区分名・会社数）が見つからないため、市場別の行は取り込みません")
+    return []
 
 
 # ===== スプレッドシート =====
@@ -297,9 +348,12 @@ def build_trend(ss, data_ws):
             break
         y, m = (y, m - 1) if m > 1 else (y - 1, 12)
     # 行の並びは最新月の並び順に合わせる
+    # 最新月に無い行（過去の月だけにある行）も消さずに、後ろに並べる
     keys, seen = [], set()
-    for r in values[1:]:
-        if r[idx["年月"]] == latest:
+    for want_latest in (True, False):
+        for r in values[1:]:
+            if (r[idx["年月"]] == latest) != want_latest or not re.fullmatch(r"\d{4}/\d{2}", r[idx["年月"]]):
+                continue
             k = (r[idx["市場区分名"]], r[idx["種別"]])
             if k not in seen:
                 seen.add(k)
@@ -317,8 +371,13 @@ def build_trend(ss, data_ws):
             row = [market, kind, label, "", "", "", ""]
             for m in months:
                 rec = table.get((m, market, kind))
-                v = to_num(rec[idx[src]]) if rec else None
-                row.append(v if v is not None else "")
+                if not rec:
+                    row.append("")            # その月のデータ自体が無い
+                    continue
+                raw = str(rec[idx[src]]).strip()
+                v = to_num(raw)
+                # JPXの記号（－：該当なし・マイナス、＊：1000倍以上）はそのまま表示して、空欄と区別する
+                row.append(v if v is not None else (raw if raw in JPX_SYMBOLS else ""))
             out.append(row)
 
     ws = get_or_create(ss, TREND_SHEET, rows=len(out) + 10, cols=len(header) + 2)
@@ -336,10 +395,10 @@ def build_trend(ss, data_ws):
     formulas = []
     for r in range(2, len(out) + 1):
         formulas.append([
-            f'=IF(OR({cur}{r}="",{prev}{r}=""),"",{cur}{r}-{prev}{r})',
-            f'=IF(OR({cur}{r}="",{prev}{r}="",{prev}{r}=0),"",{cur}{r}/{prev}{r}-1)',
-            f'=IF(OR({cur}{r}="",{m3}{r}=""),"",{cur}{r}-{m3}{r})',
-            f'=IF(OR({cur}{r}="",{m12}{r}=""),"",{cur}{r}-{m12}{r})',
+            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({prev}{r})),{cur}{r}-{prev}{r},"")',
+            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({prev}{r}),N({prev}{r})<>0),{cur}{r}/{prev}{r}-1,"")',
+            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({m3}{r})),{cur}{r}-{m3}{r},"")',
+            f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({m12}{r})),{cur}{r}-{m12}{r},"")',
         ])
     ws.update(range_name=f"D2:G{len(out)}", values=formulas, value_input_option="USER_ENTERED")
     format_trend(ss, ws, len(out), len(header))
