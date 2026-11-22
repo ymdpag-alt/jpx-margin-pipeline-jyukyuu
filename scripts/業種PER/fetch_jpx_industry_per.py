@@ -67,6 +67,29 @@ NOTE_MAX_LEN = 40    # これより長いセルは注記とみなして見出し
 TREND_METRICS = [("単純＿PER（倍）", "単純PER"), ("加重＿PER（倍）", "加重PER"),
                  ("単純＿PBR（倍）", "単純PBR"), ("加重＿PBR（倍）", "加重PBR")]
 TREND_FIXED_COLS = ["市場区分名", "種別", "指標", "前月差", "前月比", "3か月差", "12か月差"]
+# JPXが「－」（マイナス）「＊」（1000倍以上）で公表しない値を、同じ行の他の数値から計算するための式
+#   株価（単純平均）＝PBR×1株純資産＝PER×1株利益、時価総額（加重）＝PBR×純資産合計＝PER×純利益合計
+ESTIMATE_RULES = {
+    "単純＿PER（倍）": ("単純＿PBR（倍）", "単純＿1株当たり\n純資産（円）", "単純＿1株当たり\n当期純利益（円）"),
+    "加重＿PER（倍）": ("加重＿PBR（倍）", "加重＿純資産合計（円）", "加重＿親会社株主に帰属する\n当期純利益合計（円）"),
+    "単純＿PBR（倍）": ("単純＿PER（倍）", "単純＿1株当たり\n当期純利益（円）", "単純＿1株当たり\n純資産（円）"),
+    "加重＿PBR（倍）": ("加重＿PER（倍）", "加重＿親会社株主に帰属する\n当期純利益合計（円）", "加重＿純資産合計（円）"),
+}
+NO_COMPANY_TEXT = "対象なし"   # 会社数が「－」（その市場・業種に会社が無い）
+ESTIMATE_NOTE = ("灰色の斜体＝推計値。JPXが「－」（PER・PBRがマイナス）や「＊」（PER1000倍以上）で公表していない月を、"
+                 "同じ月の数値から計算（PER＝PBR×1株純資産÷1株利益、加重はPBR×純資産合計÷純利益合計。PBRも同様）。"
+                 "マイナスは赤字（または債務超過）。元のPBR・PERが小数1桁のため誤差あり。「対象なし」＝その区分に会社が無い。")
+
+
+def estimate(rec, idx, src):
+    """公表されていない値を計算する。計算できなければ None"""
+    rule = ESTIMATE_RULES.get(src)
+    if not rule or any(k not in idx for k in rule):
+        return None
+    a, b, c = (to_num(rec[idx[k]]) for k in rule)
+    if a is None or b is None or c is None or c == 0:
+        return None
+    return round(a * b / c, 1)
 
 
 # ===== 共通 =====
@@ -389,6 +412,7 @@ def build_trend(ss, data_ws):
     header = TREND_FIXED_COLS + month_cols
     first_month_col = len(TREND_FIXED_COLS) + 1  # 1始まりの列番号（H列）
     out = [header]
+    est_cells = []   # 推計値のセル（行・列は0始まり）
     for market, kind in keys:
         for src, label in TREND_METRICS:
             row = [market, kind, label, "", "", "", ""]
@@ -399,8 +423,18 @@ def build_trend(ss, data_ws):
                     continue
                 raw = str(rec[idx[src]]).strip()
                 v = to_num(raw)
-                # JPXの記号（－：該当なし・マイナス、＊：1000倍以上）はそのまま表示して、空欄と区別する
-                row.append(v if v is not None else (raw if raw in JPX_SYMBOLS else ""))
+                if v is not None:
+                    row.append(v)
+                    continue
+                if str(rec[idx["会社数"]]).strip() in JPX_SYMBOLS:
+                    row.append(NO_COMPANY_TEXT)
+                    continue
+                e = estimate(rec, idx, src)
+                if e is not None:
+                    est_cells.append((len(out), len(row)))
+                    row.append(e)
+                else:
+                    row.append(raw if raw in JPX_SYMBOLS else "")
             out.append(row)
 
     ws = get_or_create(ss, TREND_SHEET, rows=len(out) + 10, cols=len(header) + 2)
@@ -424,11 +458,12 @@ def build_trend(ss, data_ws):
             f'=IF(AND(ISNUMBER({cur}{r}),ISNUMBER({m12}{r})),{cur}{r}-{m12}{r},"")',
         ])
     ws.update(range_name=f"D2:G{len(out)}", values=formulas, value_input_option="USER_ENTERED")
-    format_trend(ss, ws, len(out), len(header))
+    format_trend(ss, ws, len(out), len(header), est_cells)
+    print(f"推計値で補ったセル: {len(est_cells)}")
     print(f"推移シートを更新: {len(out) - 1}行 × {len(months)}か月")
 
 
-def format_trend(ss, ws, nrows, ncols):
+def format_trend(ss, ws, nrows, ncols, est_cells=()):
     sid = ws.id
     meta = ss.fetch_sheet_metadata({"fields": "sheets(properties(sheetId),conditionalFormats)"})
     has_cf = any(s["properties"]["sheetId"] == sid and s.get("conditionalFormats") for s in meta["sheets"])
@@ -451,9 +486,18 @@ def format_trend(ss, ws, nrows, ncols):
                         "fields": "userEnteredFormat.numberFormat"}},
         {"repeatCell": {"range": rng(5, 7), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "+0.0;-0.0;0.0"}}},
                         "fields": "userEnteredFormat.numberFormat"}},
-        {"repeatCell": {"range": rng(7, ncols), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}}},
-                        "fields": "userEnteredFormat.numberFormat"}},
+        # 月の列：書式を毎回いったん標準に戻す（前回の推計値の色が別のセルに残らないように）
+        {"repeatCell": {"range": rng(7, ncols), "cell": {"userEnteredFormat": {
+            "numberFormat": {"type": "NUMBER", "pattern": "0.0"},
+            "textFormat": {"italic": False, "foregroundColor": {"red": 0, "green": 0, "blue": 0}}}},
+                        "fields": "userEnteredFormat.numberFormat,userEnteredFormat.textFormat.italic,userEnteredFormat.textFormat.foregroundColor"}},
+        # 見出し「指標」のセルに凡例のメモ
+        {"updateCells": {"range": rng(2, 3, 0, 1), "rows": [{"values": [{"note": ESTIMATE_NOTE}]}], "fields": "note"}},
     ]
+    for r, c in est_cells:
+        reqs.append({"repeatCell": {"range": rng(c, c + 1, r, r + 1), "cell": {"userEnteredFormat": {
+            "textFormat": {"italic": True, "foregroundColor": {"red": 0.45, "green": 0.45, "blue": 0.45}}}},
+            "fields": "userEnteredFormat.textFormat.italic,userEnteredFormat.textFormat.foregroundColor"}})
     if not has_cf:
         # 変化の方向が一目で分かるように：上昇は赤、低下は青（D〜G列）
         ranges = [rng(3, 7)]
@@ -496,6 +540,14 @@ def main():
     existing = {(r[ci["年月"]], r[ci["市場区分名"]], r[ci["種別"]]) for r in all_rows[1:] if len(r) > ci["種別"]}
     months_have = {k[0] for k in existing}
     markets_have = {k[0] for k in existing if k[2] in ("－", "-") and k[1] in MARKET_NAMES}
+
+    # 登録済みなのに市場別の行が無い月は、JPXのページにあれば自動で補う
+    auto = sorted({k[0].replace("/", "") for k in existing if re.fullmatch(r"\d{4}/\d{2}", k[0])}
+                  - {m.replace("/", "") for m in markets_have} - set(targets))
+    auto = [ym for ym in auto if ym in links]
+    if auto:
+        print(f"市場別の行が無い月を補います: {auto}")
+        targets = list(targets) + auto
 
     added = 0
     for ym in sorted(targets):
