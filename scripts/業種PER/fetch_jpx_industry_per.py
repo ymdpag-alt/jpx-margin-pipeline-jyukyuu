@@ -52,6 +52,12 @@ HEADER = [
 BASE_KEYS = {"市場区分名": ["市場区分名", "市場区分"], "Section": ["section"], "種別": ["種別"],
              "Industry": ["industry"], "会社数": ["会社数"]}
 METRIC_KEYS = [("PER", "PER"), ("PBR", "PBR"), ("NI", "当期純利益"), ("NA", "純資産")]
+# 指標を見つける手がかり（正規化した見出しに部分一致。NAは当期純利益の列を除く）
+METRIC_WORDS = {"PER": ["per", "p/e"], "PBR": ["pbr", "p/b"],
+                "NI": ["当期純利益", "純利益", "eps", "netincome"],
+                "NA": ["純資産", "bps", "netassets", "bookvalue"]}
+GROUP_WORDS = {"単純": ["単純", "simple"], "加重": ["加重", "weighted"]}
+HEADER_SCAN_UP = 4   # 「種別」の行から上に何行まで見出しとみなすか
 
 # 推移シートで並べる指標と表示名
 TREND_METRICS = [("単純＿PER（倍）", "単純PER"), ("加重＿PER（倍）", "加重PER"),
@@ -104,56 +110,86 @@ def find_links(html):
 
 
 def locate_table(df):
-    """見出し行を探し、出力列ごとの列番号と、データ開始行を返す"""
-    nrows = len(df)
-    for r in range(min(nrows, 40)):
+    """見出し行を探し、出力列ごとの列番号と、データ開始行を返す。
+    見つからない列があれば、見出し部分の中身をログに出して止める（次の修正の手がかり）"""
+    nrows, ncol = df.shape
+    for r in range(min(nrows, 60)):
         row = [norm(x) for x in df.iloc[r].tolist()]
-        if "種別" in row and "industry" in row:
-            # 見出しは前後1行（グループ行「単純／加重」と項目行）にまたがるとみなす
-            hdr_rows = [x for x in range(max(0, r - 1), min(nrows, r + 2))]
-            ncol = df.shape[1]
-            cols = {}
-            for name, keys in BASE_KEYS.items():
-                for c in range(ncol):
-                    if any(norm(df.iat[h, c]) in keys for h in hdr_rows):
-                        cols[name] = c
-                        break
-            # 単純／加重のグループ（結合セルは右へ引き継ぐ）
-            group = [""] * ncol
-            for h in hdr_rows:
-                cur = ""
-                for c in range(ncol):
-                    v = norm(df.iat[h, c])
-                    if v in ("単純", "単純平均"):
-                        cur = "単純"
-                    elif v in ("加重", "加重平均"):
-                        cur = "加重"
-                    if cur and not group[c]:
-                        group[c] = cur
-            for g in ("単純", "加重"):
-                for key, word in METRIC_KEYS:
-                    for c in range(ncol):
-                        if group[c] != g:
-                            continue
-                        texts = "".join(norm(df.iat[h, c]) for h in hdr_rows)
-                        if norm(word) in texts and (key, g) not in cols:
-                            if key == "NA" and "当期純利益" in texts:
-                                continue
-                            cols[(key, g)] = c
-                            break
-            need = list(BASE_KEYS) + [(k, g) for g in ("単純", "加重") for k, _ in METRIC_KEYS]
-            missing = [n for n in need if n not in cols]
-            if missing:
-                raise RuntimeError(f"見出しの列が見つかりません: {missing}")
-            # データ開始行：見出し行より下で、会社数が数値または「－」の最初の行
-            start = r + 1
-            while start < nrows:
-                v = to_cell(df.iat[start, cols["会社数"]])
-                if isinstance(v, (int, float)) or v == "－":
+        if "種別" not in row or "industry" not in row:
+            continue
+        # 基本列（「種別」の行の前後数行から探す）
+        near = range(max(0, r - HEADER_SCAN_UP), min(nrows, r + HEADER_SCAN_UP + 1))
+        cols = {}
+        for name, keys in BASE_KEYS.items():
+            for c in range(ncol):
+                if any(norm(df.iat[h, c]) in keys for h in near):
+                    cols[name] = c
                     break
-                start += 1
-            return cols, start
+        if "会社数" not in cols:
+            dump_header(df, near)
+            raise RuntimeError("「会社数」の列が見つかりません")
+        # データ開始行：会社数が数値または「－」の最初の行
+        start = r + 1
+        while start < nrows:
+            v = to_cell(df.iat[start, cols["会社数"]])
+            if isinstance(v, (int, float)) or v in ("－", "-"):
+                break
+            start += 1
+        hdr_rows = list(range(max(0, r - HEADER_SCAN_UP), start))
+        base_cols = set(cols.values())
+
+        # 単純／加重のグループ：各行で見つけた語を右へ引き継ぐ（結合セル対策）。上の行を優先
+        group = [""] * ncol
+        for h in hdr_rows:
+            cur = ""
+            for c in range(ncol):
+                v = norm(df.iat[h, c])
+                for g, words in GROUP_WORDS.items():
+                    if any(w in v for w in words):
+                        cur = g
+                if cur and not group[c]:
+                    group[c] = cur
+
+        texts = ["".join(norm(df.iat[h, c]) for h in hdr_rows) for c in range(ncol)]
+        for key, _ in METRIC_KEYS:
+            cands = []
+            for c in range(ncol):
+                if c in base_cols:
+                    continue
+                t = texts[c]
+                if key == "NA" and any(w in t for w in METRIC_WORDS["NI"]):
+                    continue
+                if key == "PER" and "pbr" in t:
+                    continue
+                if any(w in t for w in METRIC_WORDS[key]):
+                    cands.append(c)
+            for g in ("単純", "加重"):
+                hit = [c for c in cands if group[c] == g]
+                if hit:
+                    cols[(key, g)] = hit[0]
+            # グループ名が無い表：左から1つ目を単純、2つ目を加重とみなす
+            if (key, "単純") not in cols and (key, "加重") not in cols and len(cands) >= 2:
+                cols[(key, "単純")], cols[(key, "加重")] = cands[0], cands[1]
+                print(f"注意: {key} は単純/加重の見出しが無いため、左から順に割り当てました（列{cands[0] + 1}, 列{cands[1] + 1}）")
+
+        need = list(BASE_KEYS) + [(k, g) for g in ("単純", "加重") for k, _ in METRIC_KEYS]
+        missing = [n for n in need if n not in cols]
+        if missing:
+            dump_header(df, hdr_rows)
+            raise RuntimeError(f"見出しの列が見つかりません: {missing}")
+        print("列の対応: " + ", ".join(f"{k}=列{v + 1}" for k, v in cols.items()))
+        return cols, start
     return None, None
+
+
+def dump_header(df, rows):
+    """見出し部分をログに出す（列番号: 値）"""
+    print("---- 見出し部分の中身（原因調査用）----")
+    for h in rows:
+        cells = [f"{c + 1}:{str(df.iat[h, c]).strip()!r}" for c in range(df.shape[1])
+                 if str(df.iat[h, c]).strip() not in ("", "nan", "None")]
+        print(f"行{h + 1}: " + " | ".join(cells))
+    print("--------------------------------------")
 
 
 def parse_excel(content, ym):
