@@ -69,9 +69,6 @@ TREND_METRICS = [("単純＿PER（倍）", "単純PER"), ("加重＿PER（倍）
 # 変化を見る期間（表示名, 何か月前と比べるか）。それぞれ「差」（倍の差）と「比」（変化率）を出す
 CHANGE_SPANS = [("前月", 1), ("3か月", 3), ("12か月", 12), ("2年", 24), ("3年", 36), ("5年", 60)]
 TREND_FIXED_COLS = ["市場区分名", "種別", "指標"] + [f"{name}{kind}" for name, _ in CHANGE_SPANS for kind in ("差", "比")]
-# 過去分の自動取り込み：この年月以降で、まだ無い月をJPXのページから取り込む（5年差に必要な分）。
-# 2022年3月以前は市場区分が今と違う（東証1部など）ため、市場別の行は5年差が「－」になる（規模別の大型・中型・小型は比較できる）
-BACKFILL_FROM = "202101"
 MARKET_ROWS_FROM = "202204"   # プライム・スタンダード・グロースの市場別の行がある最初の月
 # JPXが「－」（マイナス）「＊」（1000倍以上）で公表しない値を、同じ行の他の数値から計算するための式
 #   株価（単純平均）＝PBR×1株純資産＝PER×1株利益、時価総額（加重）＝PBR×純資産合計＝PER×純利益合計
@@ -561,11 +558,10 @@ def main():
     markets_have = {k[0] for k in existing if k[2] in ("－", "-") and k[1] in MARKET_NAMES}
 
     # 自動で補う月（手動の force_ym とは別）
-    #  ① 登録済みなのに市場別の行が無い月
-    #  ② BACKFILL_FROM 以降で、まだ1行も無い月（2年・3年・5年差の計算用）
+    #  登録済みなのに市場別の行が無い月だけ（過去の月をさかのぼって取り込むことはしない。
+    #  2年・3年・5年差は、毎月のデータがたまるにつれて埋まっていく。過去分が必要なら force_ym で指定）
     auto = {k[0].replace("/", "") for k in existing
             if re.fullmatch(r"\d{4}/\d{2}", k[0]) and k[0].replace("/", "") >= MARKET_ROWS_FROM} - {m.replace("/", "") for m in markets_have}
-    auto |= {ym for ym in links if ym >= BACKFILL_FROM and ym_label(ym) not in months_have}
     auto = sorted(ym for ym in auto - set(targets) if ym in links)
     if auto:
         print(f"自動で補う月: {auto}")
